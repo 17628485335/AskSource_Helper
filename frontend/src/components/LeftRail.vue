@@ -1,11 +1,15 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
+import AuthDialog from './AuthDialog.vue'
+import SettingsDialog from './SettingsDialog.vue'
+import { useAuth } from '../stores/auth'
+import { useLlm } from '../stores/llm'
 
 /** 侧边栏折叠状态：宽度由父容器控制，此处负责内容收放 */
 const collapsed = defineModel<boolean>('collapsed', { required: true })
 
 /** 顶部 Workspace 切换器 */
-const workspaces = ['Personal', 'Product Team', 'Research', 'DevOps']
+const workspaces = ['个人空间', '产品团队', '研究组', '运维组']
 const workspaceIdx = ref(0)
 const wsOpen = ref(false)
 const wsRef = ref<HTMLElement | null>(null)
@@ -20,17 +24,17 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMousedown))
 const navItems = [
   {
     key: 'new-task',
-    label: 'New Task',
+    label: '新任务',
     icon: 'M12 5v14M5 12h14',
   },
   {
     key: 'attention',
-    label: 'My Attention',
+    label: '我的关注',
     icon: 'M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0',
   },
   {
     key: 'search',
-    label: 'Search',
+    label: '搜索',
     icon: 'M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14ZM20 20l-3.2-3.2',
   },
 ]
@@ -39,22 +43,22 @@ const navItems = [
 const bottomItems = [
   {
     key: 'sites',
-    label: 'Sites',
+    label: '站点',
     icon: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18ZM3.6 9h16.8M3.6 15h16.8M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18Z',
   },
   {
     key: 'automations',
-    label: 'Automations',
+    label: '自动化',
     icon: 'M13 2 4 14h7l-2 8 9-12h-7l2-8Z',
   },
   {
     key: 'extensions',
-    label: 'Extensions',
+    label: '扩展',
     icon: 'M4 7h5V4a1 1 0 1 1 2 0v3h5a1 1 0 1 1 0 2H9v5a1 1 0 1 1-2 0V9H4a1 1 0 1 1 0-2ZM15 14h3a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1h-4a1 1 0 0 1-1-1v-3a2 2 0 0 1 2-2Z',
   },
   {
     key: 'more',
-    label: 'More',
+    label: '更多',
     icon: 'M5 12h14',
     dots: true,
   },
@@ -62,21 +66,31 @@ const bottomItems = [
 
 const activeNav = ref('new-task')
 
-/** 登录态（本地模拟）：未登录时底部显示登录/免费注册，登录后显示账号信息 */
-const loggedIn = ref(false)
+/** 登录态：接后端 /auth/*（token 存 localStorage，用户信息来自 store） */
+const { user, isLoggedIn, logout, restoreSession } = useAuth()
 
-/** 演示用：模拟登录/注册成功（接入真实鉴权后替换为路由跳转/OAuth） */
-function handleLogin() {
-  loggedIn.value = true
-}
-function handleRegister() {
-  loggedIn.value = true
+const dialogOpen = ref(false)
+const dialogMode = ref<'login' | 'register'>('login')
+const settingsOpen = ref(false)
+const { load: loadLlm } = useLlm()
+
+function openSettings() {
+  settingsOpen.value = true
 }
 
-/** 演示用：账号菜单切换回未登录态 */
-function handleLogout() {
-  loggedIn.value = false
+function openLogin() {
+  dialogMode.value = 'login'
+  dialogOpen.value = true
 }
+function openRegister() {
+  dialogMode.value = 'register'
+  dialogOpen.value = true
+}
+
+onMounted(() => {
+  restoreSession()
+  loadLlm()
+})
 </script>
 
 <template>
@@ -131,7 +145,7 @@ function handleLogout() {
           @click="wsOpen = !wsOpen"
           class="w-full h-8 flex items-center gap-1.5 px-2.5 rounded-lg text-[#4b4938] hover:bg-white/60 transition"
           :class="wsOpen ? 'bg-white/70 shadow-[0_1px_2px_rgba(90,80,60,0.05)]' : ''"
-          title="Switch workspace"
+          title="切换工作区"
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 opacity-60">
             <rect x="3" y="4" width="18" height="13" rx="2" />
@@ -149,7 +163,7 @@ function handleLogout() {
           class="absolute left-0 top-10 z-30 w-52 rounded-xl bg-white border border-[#EAE5D3] shadow-lg shadow-stone-900/5 p-1.5"
         >
           <p class="px-2.5 pt-1 pb-1.5 text-[10.5px] font-semibold tracking-[0.12em] uppercase text-[#a4a190]">
-            Workspaces
+            工作区
           </p>
           <button
             v-for="(w, i) in workspaces"
@@ -170,7 +184,7 @@ function handleLogout() {
             type="button"
             class="w-full text-left px-2.5 py-1.5 rounded-lg text-[12.5px] text-[#6d6a52] hover:bg-[#F7F3E9] transition"
           >
-            Manage workspaces…
+            管理工作区…
           </button>
         </div>
       </div>
@@ -179,7 +193,7 @@ function handleLogout() {
         type="button"
         class="h-7 w-7 shrink-0 grid place-items-center rounded-lg text-[#5b5945] hover:bg-black/5 transition"
         :class="collapsed ? '' : 'ml-auto'"
-        :title="collapsed ? 'Expand sidebar' : 'Collapse sidebar'"
+        :title="collapsed ? '展开侧边栏' : '折叠侧边栏'"
         @click="collapsed = !collapsed"
       >
         <svg
@@ -233,12 +247,12 @@ function handleLogout() {
     >
       <header class="flex items-center pb-1.5" :class="collapsed ? 'justify-center' : 'justify-between px-2'">
         <span v-if="!collapsed" class="text-[10.5px] font-semibold tracking-[0.14em] uppercase text-[#6d6a52]">
-          Workspaces
+          工作区
         </span>
         <button
           type="button"
           class="h-6 w-6 grid place-items-center rounded-md text-[#4b4938] hover:bg-white/60 transition"
-          title="New workspace"
+          title="新建工作区"
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
             <path d="M12 5v14M5 12h14" />
@@ -248,7 +262,7 @@ function handleLogout() {
 
       <div v-if="!collapsed" class="flex-1 min-h-0 grid place-items-center text-center px-4">
         <p class="text-[12px] text-[#7d7a60] leading-relaxed">
-          No task data yet :)
+          暂无任务数据 :)
         </p>
       </div>
       <div v-else class="flex-1 min-h-0" />
@@ -285,7 +299,7 @@ function handleLogout() {
         type="button"
         class="mt-3 flex items-center rounded-2xl bg-white/70 backdrop-blur-sm border border-white/80 hover:bg-white/85 transition text-left shadow-[0_1px_2px_rgba(90,80,60,0.04)]"
         :class="collapsed ? 'justify-center p-2' : 'w-full gap-2.5 p-3'"
-        title="Get Bonus Credits"
+        title="领取奖励额度"
       >
         <span class="h-8 w-8 shrink-0 grid place-items-center rounded-xl bg-gradient-to-br from-[#F3DFA8] to-[#B8975A] text-white">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -294,9 +308,9 @@ function handleLogout() {
           </svg>
         </span>
         <span v-if="!collapsed" class="min-w-0 flex-1 leading-tight">
-          <span class="block text-[12.5px] font-semibold text-[#2b2a22]">Get Bonus Credits</span>
+          <span class="block text-[12.5px] font-semibold text-[#2b2a22]">领取奖励额度</span>
           <span class="block text-[11px] text-[#6d6a52] mt-0.5 truncate">
-            Invite friends, earn extra usage
+            邀请好友，赢得额外用量
           </span>
         </span>
         <svg v-if="!collapsed" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="text-[#6d6a52] shrink-0">
@@ -306,21 +320,21 @@ function handleLogout() {
 
       <!-- 未登录：登录 / 免费注册 -->
       <div
-        v-if="!loggedIn"
+        v-if="!isLoggedIn"
         class="mt-3 flex"
         :class="collapsed ? 'flex-col items-center gap-1.5' : 'gap-2 px-1'"
       >
         <template v-if="!collapsed">
           <button
             type="button"
-            @click="handleLogin"
+            @click="openLogin"
             class="flex-1 h-8 rounded-lg border border-[#cfc6ae] bg-white/70 text-[12.5px] font-medium text-[#2b2a22] hover:bg-white transition"
           >
             登录
           </button>
           <button
             type="button"
-            @click="handleRegister"
+            @click="openRegister"
             class="flex-1 h-8 rounded-lg bg-[#333228] text-[12.5px] font-medium text-[#F7F3E4] hover:bg-[#4a4838] transition"
           >
             免费注册
@@ -329,7 +343,7 @@ function handleLogout() {
         <template v-else>
           <button
             type="button"
-            @click="handleLogin"
+            @click="openLogin"
             class="h-8 w-8 grid place-items-center rounded-lg text-[#5b5945] hover:bg-white/60 transition"
             title="登录"
           >
@@ -340,7 +354,7 @@ function handleLogout() {
           </button>
           <button
             type="button"
-            @click="handleRegister"
+            @click="openRegister"
             class="h-8 w-8 grid place-items-center rounded-lg bg-[#333228] text-[#F7F3E4] hover:bg-[#4a4838] transition"
             title="免费注册"
           >
@@ -360,20 +374,21 @@ function handleLogout() {
         <button
           type="button"
           class="h-8 w-8 shrink-0 rounded-full bg-gradient-to-br from-[#D9C9A3] to-[#7C9A5C] grid place-items-center text-[12px] font-semibold text-white"
-          :title="collapsed ? 'Jay · 点击退出（演示）' : undefined"
-          @click="handleLogout"
+          :title="collapsed ? user?.username + ' · 点击退出' : undefined"
+          @click="logout"
         >
-          J
+          {{ (user?.username || '?').charAt(0).toUpperCase() }}
         </button>
         <span v-if="!collapsed" class="min-w-0 flex-1 leading-tight">
-          <span class="block text-[12.5px] font-semibold text-[#2b2a22] truncate">Jay</span>
-          <span class="block text-[10.5px] text-[#6d6a52] truncate">jay@asksource.ai</span>
+          <span class="block text-[12.5px] font-semibold text-[#2b2a22] truncate">{{ user?.username }}</span>
+          <span class="block text-[10.5px] text-[#6d6a52] truncate">{{ user?.email }}</span>
         </span>
         <button
           v-if="!collapsed"
           type="button"
+          @click="openSettings"
           class="h-7 w-7 grid place-items-center rounded-lg text-[#5b5945] hover:bg-white/60 transition"
-          title="Settings"
+          title="设置"
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="3" />
@@ -382,5 +397,11 @@ function handleLogout() {
         </button>
       </div>
     </div>
+
+    <!-- 登录 / 注册弹窗 -->
+    <AuthDialog v-model="dialogOpen" :initial-mode="dialogMode" />
+
+    <!-- 设置弹窗（LLM 配置） -->
+    <SettingsDialog v-model="settingsOpen" />
   </aside>
 </template>

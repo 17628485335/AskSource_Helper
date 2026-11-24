@@ -27,3 +27,8 @@ htmlcov/
 # IDE
 .idea/
 .vscode/
+
+# 环境变量与本地密钥（保留 .env.example 模板）
+.env
+.env.*
+!.env.example

@@ -5,4 +5,18 @@ import tailwindcss from '@tailwindcss/vite'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [vue(), tailwindcss()],
+  server: {
+    proxy: {
+      // 开发环境把 /auth/* 代理到独立的 auth 微服务（默认 8001），规避跨域
+      '/auth': {
+        target: 'http://127.0.0.1:8001',
+        changeOrigin: true,
+      },
+      // 设置类接口（/settings/model-providers 等）同样代理到后端
+      '/settings': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+    },
+  },
 })
