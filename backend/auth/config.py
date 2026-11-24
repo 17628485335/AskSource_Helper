@@ -28,7 +28,10 @@ class Settings(BaseSettings):
     # JWT 配置（下方仅为开发默认值，生产必须通过环境变量覆盖）
     jwt_secret_key: str = "dev-only-insecure-secret-change-me-in-production"
     jwt_algorithm: str = "HS256"
-    access_token_expire_minutes: int = 60
+    access_token_expire_minutes: int = 15
+
+    # 刷新令牌有效期（天）：入库的不透明令牌，登出可吊销
+    refresh_token_expire_days: int = 7
 
 
 @lru_cache

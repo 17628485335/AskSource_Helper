@@ -17,6 +17,20 @@ export default defineConfig({
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
+      // 会话与流式对话接口（/sessions、/chat）
+      '/sessions': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      // 工作区接口（/workspaces）
+      '/workspaces': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/chat': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
     },
   },
 })

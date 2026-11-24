@@ -5,7 +5,9 @@ import jwt
 from auth.security import (
     create_access_token,
     decode_access_token,
+    generate_refresh_token,
     hash_password,
+    hash_token,
     verify_password,
 )
 
@@ -34,3 +36,21 @@ def test_decode_invalid_token_raises():
 
     with pytest.raises(jwt.PyJWTError):
         decode_access_token("this.is.bogus")
+
+
+def test_refresh_token_is_opaque_and_unique():
+    a = generate_refresh_token()
+    b = generate_refresh_token()
+    assert a != b
+    # token_urlsafe(48) 产生足够长的 url-safe 随机串
+    assert len(a) >= 40
+
+
+def test_hash_token_stable_and_hex():
+    raw = generate_refresh_token()
+    h1 = hash_token(raw)
+    h2 = hash_token(raw)
+    assert h1 == h2  # 同一令牌哈希稳定
+    assert h1 != hash_token(generate_refresh_token())  # 不同令牌哈希不同
+    assert len(h1) == 64  # sha256 十六进制摘要
+    assert all(c in "0123456789abcdef" for c in h1)

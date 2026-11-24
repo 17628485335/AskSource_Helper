@@ -14,6 +14,8 @@ const loading = ref(false)
 const error = ref<string | null>(null)
 
 const isLoggedIn = computed(() => user.value !== null)
+/** 后端用 is_admin 卡写接口，前端只拿它决定「设置」入口是否可见 */
+const isAdmin = computed(() => user.value?.is_admin === true)
 
 function setError(e: unknown) {
   error.value = e instanceof Error ? e.message : '操作失败，请稍后重试'
@@ -52,7 +54,9 @@ async function register(username: string, email: string, password: string): Prom
   }
 }
 
-function logout() {
+/** 登出：先吊销服务端 refresh（后端清 HttpOnly Cookie），再清本地 access */
+async function logout() {
+  await authApi.logoutApi()
   authApi.clearToken()
   user.value = null
   error.value = null
@@ -61,6 +65,8 @@ function logout() {
 /** 应用启动时若本地已有 token，则尝试恢复登录态 */
 async function restoreSession(): Promise<void> {
   if (!authApi.getToken()) return
+  // 刷新页面后 token 是从 localStorage 读出来的，不会经过 setToken，保活得显式启起来
+  authApi.startTokenKeepAlive()
   error.value = null
   try {
     user.value = await authApi.getMe()
@@ -71,12 +77,20 @@ async function restoreSession(): Promise<void> {
   }
 }
 
+// 保活续期失败（refresh 也过期或被吊销）：api/auth 已清掉本地 token，这里把用户态一起作废，
+// 界面回到未登录（左侧栏显示登录入口），而不是留着一个发不出消息的「假登录」
+authApi.onSessionExpired(() => {
+  user.value = null
+  error.value = '登录已过期，请重新登录'
+})
+
 export function useAuth() {
   return {
     user: readonly(user),
     loading: readonly(loading),
     error: readonly(error),
     isLoggedIn,
+    isAdmin,
     login,
     register,
     logout,

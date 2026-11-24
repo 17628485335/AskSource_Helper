@@ -8,6 +8,7 @@
 from functools import lru_cache
 from typing import Any
 
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -64,6 +65,9 @@ class LLMSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
+        # 嵌套字段靠双下划线映射（如 DEEPSEEK__API_KEY -> deepseek.api_key），
+        # 不设这个分隔符时 .env 里的平台配置会被 extra="ignore" 静默丢掉。
+        env_nested_delimiter="__",
         extra="ignore",
     )
 
@@ -73,12 +77,23 @@ class LLMSettings(BaseSettings):
     bailian: ProviderConfig | None = None
 
 
-# (平台, 模型) -> 深度思考开启时要合并到 init_chat_model 的请求参数
-# 差异全靠这张表声明，新增模型只加一行，不改逻辑
-THINKING: dict[tuple[str, str], dict[str, Any]] = {
-    ("deepseek", "deepseek-chat"): {"model": "deepseek-reasoner"},  # 靠换模型开启
-    ("siliconflow", "Qwen3-32B"): {"extra_body": {"enable_thinking": True}},
-    ("bailian", "qwen-plus"): {"extra_body": {"enable_thinking": True}, "streaming": True},
+# 平台 -> 深度思考开关时要合并到 init_chat_model 的请求参数，分 on / off 两套：
+# on 对应 thinking=True；off 对应 thinking=False（前端选「快速」），用于显式关闭默认开启推理的模型。
+# 只按平台查表，不区分具体模型：同平台下思考开关的参数写法一致。
+# 新增平台只加一行，不改逻辑
+THINKING: dict[str, dict[str, dict[str, Any]]] = {
+    "deepseek": {"on": {"model": "deepseek-reasoner"}},  # 靠换模型开启；关闭即用原模型，无需额外参数
+    "siliconflow": {
+        "on": {"extra_body": {"enable_thinking": True}},
+        # 混合思考模型默认开思考，快速模式必须显式关。实测（11-25）Xing4.0-29B 支持本参数：
+        # 经 SDK 平铺到 JSON 顶层后思考帧归零；注意 extra_body 是客户端概念，
+        # 用裸 httpx 对照时必须把键放顶层，直接发嵌套的 extra_body 会被服务端静默忽略。
+        "off": {"extra_body": {"enable_thinking": False}},
+    },
+    "bailian": {
+        "on": {"extra_body": {"enable_thinking": True}, "streaming": True},
+        "off": {"extra_body": {"enable_thinking": False}},
+    },
 }
 
 
@@ -88,16 +103,73 @@ def get_llm_settings() -> LLMSettings:
     return LLMSettings()
 
 
-def build_model(platform: str, model: str, thinking: bool):
-    """按平台 + 模型构建 langchain chat 模型；开启深度思考时查表自动带对应参数。
+def _reasoning_delta(chunk: Any) -> str:
+    """从一条流式 chunk 里取思考增量；取不到就返回空串。
 
-    base_url 由 resolve_base_url 得出（env 优先，否则内置默认）；api_key / 默认模型也从 env 覆盖。
-    返回的对象可直接传给 langchain.agents.create_agent(model=..., tools=...)。
+    _astream 传进来的已经是 dict（chunk.model_dump()），所以逐层都要容错：
+    usage 帧、choices 为空的帧、甚至 delta 里没有该字段的普通模型，都是正常情况。
     """
-    from langchain.chat_models import init_chat_model
+    if not isinstance(chunk, dict):
+        return ""
+    choices = chunk.get("choices") or (chunk.get("chunk") or {}).get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+    delta = choices[0].get("delta")
+    value = delta.get("reasoning_content") if isinstance(delta, dict) else None
+    return value if isinstance(value, str) else ""
 
-    base_url = resolve_base_url(platform)
-    if not base_url:
+
+class ReasoningChatOpenAI(ChatOpenAI):
+    """把上游 delta 里的 reasoning_content 接住的 ChatOpenAI，其余行为与父类一致。
+
+    为什么要自己补：langchain-openai 在模块注释里写明 reasoning_content 这类推理字段
+    「are not extracted」，不提取也不进 additional_kwargs，官方建议改用平台专用子类
+    （如 ChatDeepSeek）。不接的话实测深度档 82 个 delta 里有 79 个变成空 content ——
+    前端看不到任何思考过程，快速档和深度档的可见输出长得一模一样，用户只会认为档位没生效。
+
+    思考内容只挂在 additional_kwargs 里随流转发给前端，不进正文、不落库。
+    """
+
+    def _convert_chunk_to_generation_chunk(
+        self,
+        chunk: Any,
+        default_chunk_class: type,
+        base_generation_info: dict | None,
+    ) -> Any:
+        generation = super()._convert_chunk_to_generation_chunk(
+            chunk, default_chunk_class, base_generation_info
+        )
+        if generation is None:
+            return None
+        reasoning = _reasoning_delta(chunk)
+        if reasoning:
+            generation.message.additional_kwargs["reasoning_content"] = reasoning
+        return generation
+
+
+def build_model(
+    platform: str,
+    model: str,
+    thinking: bool,
+    *,
+    api_key: str = "",
+    base_url: str = "",
+):
+    """按平台 + 模型构建 chat 模型；查表按 thinking 布尔合并 on / off 对应参数。
+
+    thinking=True 合并表里的 on（深度思考）；thinking=False 合并 off（如 enable_thinking=false，
+    显式关闭 Qwen3 这类默认开启推理的模型）；表里没有 off 则保持默认行为。
+    base_url 由 resolve_base_url 得出（env 优先，否则内置默认）；api_key / 默认模型也从 env 覆盖。
+    api_key / base_url 传入非空值时优先级最高，用于把数据库里用户自配的密钥接进来。
+    返回的对象可直接传给 langchain.agents.create_agent(model=..., tools=...)。
+
+    这里不走 init_chat_model 而是直接构造 ReasoningChatOpenAI：这几个平台本来就都是
+    OpenAI 兼容端点，init_chat_model(model_provider="openai") 出来的就是 ChatOpenAI，
+    少了这层间接才能换成自己的子类；传参名（model / base_url / api_key / extra_body /
+    streaming）都是父类字段，_get_request_payload 的输出与原写法逐字一致。
+    """
+    resolved_base = base_url or resolve_base_url(platform)
+    if not resolved_base:
         raise ValueError(f"未知的平台: {platform}")
 
     settings = get_llm_settings()
@@ -105,13 +177,14 @@ def build_model(platform: str, model: str, thinking: bool):
 
     kwargs: dict[str, Any] = {
         "model": model or (conf.default_model if conf else ""),
-        "model_provider": "openai",
-        "base_url": base_url,
-        "api_key": conf.api_key if conf else "",
+        "base_url": resolved_base,
+        "api_key": api_key or (conf.api_key if conf else ""),
     }
-    if thinking:
-        kwargs.update(THINKING.get((platform, kwargs["model"]), {}))
-    return init_chat_model(**kwargs)
+    mapping = THINKING.get(platform, {})
+    # 两个分支都要容错：表里没配这个平台时 mapping 为空 dict，
+    # 用 mapping["on"] 会直接 KeyError；此时保持模型默认行为（与无映射时一致）。
+    kwargs.update(mapping.get("on", {}) if thinking else mapping.get("off", {}))
+    return ReasoningChatOpenAI(**kwargs)
 
 
 async def test_provider_connection(

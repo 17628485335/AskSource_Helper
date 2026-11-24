@@ -1,18 +1,120 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import AuthDialog from './AuthDialog.vue'
 import SettingsDialog from './SettingsDialog.vue'
 import { useAuth } from '../stores/auth'
+import { useChat } from '../stores/chat'
 import { useLlm } from '../stores/llm'
+import { useUi } from '../stores/ui'
+import { useWorkspace } from '../stores/workspace'
 
 /** 侧边栏折叠状态：宽度由父容器控制，此处负责内容收放 */
 const collapsed = defineModel<boolean>('collapsed', { required: true })
 
-/** 顶部 Workspace 切换器 */
-const workspaces = ['个人空间', '产品团队', '研究组', '运维组']
-const workspaceIdx = ref(0)
+/** 顶部 Workspace 切换器（真数据：/workspaces，选中项持久化在 localStorage） */
+const {
+  workspaces,
+  sessions,
+  activeId,
+  activeWorkspace,
+  lastError,
+  load: loadWorkspaces,
+  select: selectWorkspace,
+  loadSessions,
+  create: createWs,
+  rename: renameWs,
+  remove: removeWs,
+} = useWorkspace()
 const wsOpen = ref(false)
 const wsRef = ref<HTMLElement | null>(null)
+
+/* 新建：下拉菜单与中部区块的 + 共用同一个内联输入态 */
+const creating = ref(false)
+const newName = ref('')
+/* 重命名：正在改名的工作区 id + 草稿；删除直接 confirm */
+const editingId = ref<number | null>(null)
+const editName = ref('')
+
+async function submitNew() {
+  const name = newName.value.trim()
+  if (!name) {
+    creating.value = false
+    return
+  }
+  const ws = await createWs(name)
+  if (ws) {
+    newName.value = ''
+    creating.value = false
+    selectWorkspace(ws.id) // 新建即切入，会话列表随之刷新
+  }
+}
+
+async function commitRename() {
+  const id = editingId.value
+  const name = editName.value.trim()
+  editingId.value = null
+  if (id != null && name) await renameWs(id, name)
+}
+
+async function removeOne(w: { id: number; name: string; is_default: boolean }) {
+  if (w.is_default) {
+    lastError.value = '默认工作区不可删除'
+    return
+  }
+  if (!window.confirm(`删除工作区「${w.name}」？其中的会话会保留，但变为未分组。`)) return
+  await removeWs(w.id)
+}
+
+function startRename(w: { id: number; name: string }) {
+  editingId.value = w.id
+  editName.value = w.name
+}
+
+/* 历史会话：点击恢复进聊天区 */
+const { goHome, goChat } = useUi()
+const { loadSession, sessionId, reset: resetChat } = useChat()
+const openingId = ref<number | null>(null)
+
+// 对话中首次产生新会话（meta 事件）后刷新当前工作区的会话列表
+watch(sessionId, (v, old) => {
+  if (v && v !== old) void loadSessions()
+})
+
+async function openSession(s: {
+  id: number
+  platform: string
+  model: string
+  thinking: boolean
+}) {
+  if (openingId.value === s.id) return
+  openingId.value = s.id
+  lastError.value = ''
+  try {
+    await loadSession(s.id, { platform: s.platform, model: s.model, thinking: s.thinking })
+    goChat() // 品牌首页态下点开历史会话也要回到对话区
+  } catch (e) {
+    lastError.value = e instanceof Error ? e.message : '打开会话失败，请确认已登录'
+  } finally {
+    openingId.value = null
+  }
+}
+
+function formatDay(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  const today = new Date()
+  const sameYear = d.getFullYear() === today.getFullYear()
+  const md = `${d.getMonth() + 1}月${d.getDate()}日`
+  return sameYear ? md : `${d.getFullYear()}年${md}`
+}
+
+/** 悬停时展示的精确时间：完整到秒（年-月-日 时:分:秒） */
+function formatTime(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
 
 function onDocMousedown(e: MouseEvent) {
   if (wsRef.value && !wsRef.value.contains(e.target as Node)) wsOpen.value = false
@@ -24,7 +126,7 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMousedown))
 const navItems = [
   {
     key: 'new-task',
-    label: '新任务',
+    label: '新对话',
     icon: 'M12 5v14M5 12h14',
   },
   {
@@ -66,8 +168,17 @@ const bottomItems = [
 
 const activeNav = ref('new-task')
 
+/** 主导航点击：新对话清空当前聊天回到空白画布，其余项暂只切换高亮 */
+function onNavClick(key: string) {
+  activeNav.value = key
+  if (key === 'new-task') {
+    resetChat()
+    goChat()
+  }
+}
+
 /** 登录态：接后端 /auth/*（token 存 localStorage，用户信息来自 store） */
-const { user, isLoggedIn, logout, restoreSession } = useAuth()
+const { user, isLoggedIn, isAdmin, restoreSession } = useAuth()
 
 const dialogOpen = ref(false)
 const dialogMode = ref<'login' | 'register'>('login')
@@ -89,7 +200,18 @@ function openRegister() {
 
 onMounted(() => {
   restoreSession()
-  loadLlm()
+  // 不在这里拉 LLM 配置：此刻登录态还没恢复完，而且普通用户拉了只会拿到 403
+  loadWorkspaces()
+})
+
+// 登录后拉一次工作区（模型配置只管理员需要）；退出时清本地列表（服务端数据不动）
+watch(isLoggedIn, (v) => {
+  if (v) {
+    if (isAdmin.value) loadLlm()
+    loadWorkspaces()
+  } else {
+    useWorkspace().clear()
+  }
 })
 </script>
 
@@ -102,8 +224,13 @@ onMounted(() => {
       class="shrink-0 flex items-center gap-2 px-4 pt-4 pb-2"
       :class="collapsed ? 'justify-center px-2' : ''"
     >
-      <!-- Logo（折叠时整体隐藏） -->
-      <div v-if="!collapsed" class="flex items-center gap-2.5 select-none">
+      <!-- Logo（折叠时整体隐藏）：点击回到品牌首页 -->
+      <div
+        v-if="!collapsed"
+        class="flex items-center gap-2.5 select-none cursor-pointer rounded-lg -mx-1 px-1 hover:bg-white/50 transition"
+        title="首页"
+        @click="goHome()"
+      >
         <svg width="32" height="32" viewBox="0 0 32 32" aria-label="AskSource logo">
           <defs>
             <linearGradient id="as-mark" x1="0" y1="0" x2="1" y2="1">
@@ -133,7 +260,7 @@ onMounted(() => {
         </svg>
         <span
           v-if="!collapsed"
-          class="text-[15px] font-semibold tracking-tight text-[#2b2a22]"
+          class="text-[14px] font-semibold tracking-tight text-[#2b2a22]"
         >
           Ask<span class="text-[#6d6a52]">Source</span>
         </span>
@@ -147,12 +274,12 @@ onMounted(() => {
           :class="wsOpen ? 'bg-white/70 shadow-[0_1px_2px_rgba(90,80,60,0.05)]' : ''"
           title="切换工作区"
         >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 opacity-60">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 opacity-60">
             <rect x="3" y="4" width="18" height="13" rx="2" />
             <path d="M8.5 21h7M12 17v4" />
           </svg>
           <span class="min-w-0 flex-1 text-left text-[12.5px] font-medium truncate">
-            {{ workspaces[workspaceIdx] }}
+            {{ activeWorkspace?.name || (isLoggedIn ? '加载中…' : '未登录') }}
           </span>
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="shrink-0 opacity-50" stroke-linecap="round">
             <path d="m6 9 6 6 6-6" />
@@ -162,29 +289,70 @@ onMounted(() => {
           v-if="wsOpen"
           class="absolute left-0 top-10 z-30 w-52 rounded-xl bg-white border border-[#EAE5D3] shadow-lg shadow-stone-900/5 p-1.5"
         >
-          <p class="px-2.5 pt-1 pb-1.5 text-[10.5px] font-semibold tracking-[0.12em] uppercase text-[#a4a190]">
+          <p class="px-2.5 pt-1 pb-1.5 text-[10.5px] font-medium tracking-[0.12em] uppercase text-[#a4a190]">
             工作区
           </p>
-          <button
-            v-for="(w, i) in workspaces"
-            :key="w"
-            type="button"
-            @click="((workspaceIdx = i), (wsOpen = false))"
-            class="w-full text-left px-2.5 py-1.5 rounded-lg text-[12.5px] transition"
+          <div
+            v-for="w in workspaces"
+            :key="w.id"
+            class="group flex items-center rounded-lg transition"
             :class="
-              i === workspaceIdx
-                ? 'bg-[#F2EDE1] text-[#2b2a22] font-medium'
+              w.id === activeId
+                ? 'bg-[#F2EDE1] text-[#2b2a22]'
                 : 'text-[#4b4938] hover:bg-[#F7F3E9]'
             "
           >
-            {{ w }}
-          </button>
+            <!-- 改名态：行内输入，Enter/失焦提交，Esc 取消 -->
+            <input
+              v-if="editingId === w.id"
+              v-model="editName"
+              autofocus
+              @keydown.enter="commitRename"
+              @keydown.esc="editingId = null"
+              @blur="commitRename"
+              class="flex-1 min-w-0 mx-2.5 my-1 px-1.5 py-1 rounded-md text-[12.5px] bg-white border border-[#D8D2BC] outline-none"
+            />
+            <button
+              v-else
+              type="button"
+              @click="((selectWorkspace(w.id)), (wsOpen = false))"
+              class="flex-1 min-w-0 text-left px-2.5 py-2 rounded-lg text-[12.5px] font-medium truncate"
+              :class="w.id === activeId ? 'font-semibold' : ''"
+            >
+              {{ w.name }}
+            </button>
+            <template v-if="editingId !== w.id">
+              <button
+                type="button"
+                @click.stop="startRename(w)"
+                class="opacity-0 group-hover:opacity-100 h-7 w-7 mr-0.5 grid place-items-center rounded-md text-[#8a8872] hover:bg-white/80 transition"
+                title="重命名"
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+                </svg>
+              </button>
+              <button
+                v-if="!w.is_default"
+                type="button"
+                @click.stop="removeOne(w)"
+                class="opacity-0 group-hover:opacity-100 h-7 w-7 mr-1 grid place-items-center rounded-md text-[#8a8872] hover:text-red-500 hover:bg-white/80 transition"
+                title="删除"
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+                </svg>
+              </button>
+            </template>
+          </div>
+          <!-- 新建入口：关掉下拉，光标到中部区块的内联输入框 -->
           <div class="my-1 border-t border-[#F0EBDA]" />
           <button
             type="button"
-            class="w-full text-left px-2.5 py-1.5 rounded-lg text-[12.5px] text-[#6d6a52] hover:bg-[#F7F3E9] transition"
+            @click="((wsOpen = false), (creating = true))"
+            class="w-full text-left px-2.5 py-2 rounded-lg text-[12.5px] text-[#6d6a52] hover:bg-[#F7F3E9] transition"
           >
-            管理工作区…
+            + 新建工作区
           </button>
         </div>
       </div>
@@ -223,7 +391,7 @@ onMounted(() => {
         v-for="item in navItems"
         :key="item.key"
         type="button"
-        @click="activeNav = item.key"
+        @click="onNavClick(item.key)"
         class="w-full flex items-center rounded-xl font-medium transition"
         :class="[
           collapsed ? 'justify-center h-9' : 'gap-2.5 px-3 py-2 text-[13px]',
@@ -233,7 +401,7 @@ onMounted(() => {
         ]"
         :title="item.label"
       >
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 opacity-70">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 opacity-70">
           <path :d="item.icon" />
         </svg>
         <span v-if="!collapsed" class="truncate">{{ item.label }}</span>
@@ -246,13 +414,14 @@ onMounted(() => {
       :class="collapsed ? 'px-2' : 'px-3'"
     >
       <header class="flex items-center pb-1.5" :class="collapsed ? 'justify-center' : 'justify-between px-2'">
-        <span v-if="!collapsed" class="text-[10.5px] font-semibold tracking-[0.14em] uppercase text-[#6d6a52]">
-          工作区
+        <span v-if="!collapsed" class="text-[10.5px] font-medium tracking-[0.14em] uppercase text-[#6d6a52] truncate">
+          {{ activeWorkspace?.name || '工作区' }}
         </span>
         <button
           type="button"
+          @click="isLoggedIn ? ((creating = true)) : openLogin()"
           class="h-6 w-6 grid place-items-center rounded-md text-[#4b4938] hover:bg-white/60 transition"
-          title="新建工作区"
+          :title="isLoggedIn ? '新建工作区' : '登录后新建工作区'"
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
             <path d="M12 5v14M5 12h14" />
@@ -260,10 +429,56 @@ onMounted(() => {
         </button>
       </header>
 
-      <div v-if="!collapsed" class="flex-1 min-h-0 grid place-items-center text-center px-4">
-        <p class="text-[12px] text-[#7d7a60] leading-relaxed">
-          暂无任务数据 :)
-        </p>
+      <div v-if="!collapsed" class="flex-1 min-h-0 overflow-y-auto scroll-thin px-1 space-y-0.5">
+        <!-- 错误就近常驻：包括工作区写操作与打开历史会话失败 -->
+        <p v-if="lastError" class="px-1 py-1 text-[11px] text-red-500">{{ lastError }}</p>
+        <!-- 新建工作区：内联输入（由本区块 + 或下拉菜单触发） -->
+        <template v-if="creating">
+          <input
+            v-model="newName"
+            autofocus
+            placeholder="工作区名称，Enter 创建"
+            @keydown.enter="submitNew"
+            @keydown.esc="((creating = false), (newName = ''))"
+            @blur="creating = newName.trim() ? creating : false"
+            class="w-full px-2.5 py-2 rounded-lg text-[12.5px] bg-white border border-[#D8D2BC] outline-none placeholder:text-[#b5b19c]"
+          />
+        </template>
+
+        <!-- 当前工作区下的会话列表 -->
+        <button
+          v-for="s in sessions"
+          :key="s.id"
+          type="button"
+          @click="openSession(s)"
+          class="group w-full px-2 py-2 rounded-lg text-left transition"
+          :class="s.id === openingId ? 'bg-white/70' : 'hover:bg-white/50'"
+          :title="s.title || '未命名对话'"
+        >
+          <div class="flex items-center gap-2">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 opacity-50">
+              <path d="M21 12a8 8 0 0 1-8 8H4l2-3a8 8 0 1 1 15-5Z" />
+            </svg>
+            <span class="min-w-0 flex-1 text-[12.5px] text-[#4b4938] truncate">{{ s.title || '未命名对话' }}</span>
+            <span class="shrink-0 text-[10px] text-[#a4a190]">{{ formatDay(s.updated_at) }}</span>
+          </div>
+          <!-- 悬停时下方展开精确时间 -->
+          <p class="overflow-hidden max-h-0 opacity-0 group-hover:max-h-5 group-hover:opacity-100 group-hover:mt-1 transition-all duration-200 pl-[21px] text-[10.5px] leading-none text-[#8a8872]">
+            最后活跃 · {{ formatTime(s.updated_at) }}
+          </p>
+        </button>
+
+        <div
+          v-if="!creating && isLoggedIn && !sessions.length"
+          class="h-full grid place-items-center text-center px-4"
+        >
+          <p class="text-[12px] text-[#7d7a60] leading-relaxed">
+            本工作区还没有对话 :)<br />发一条消息就会出现在这里
+          </p>
+        </div>
+        <div v-else-if="!creating && !isLoggedIn" class="h-full grid place-items-center text-center px-4">
+          <p class="text-[12px] text-[#7d7a60] leading-relaxed">登录后查看工作区会话</p>
+        </div>
       </div>
       <div v-else class="flex-1 min-h-0" />
     </section>
@@ -278,10 +493,10 @@ onMounted(() => {
           <button
             type="button"
             class="w-full flex items-center rounded-lg text-[12.5px] text-[#4b4938] hover:bg-white/50 transition"
-            :class="collapsed ? 'justify-center h-8' : 'gap-2.5 px-3 py-1.5'"
+            :class="collapsed ? 'justify-center h-8' : 'gap-2.5 px-3 py-2'"
             :title="item.label"
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 opacity-70">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 opacity-70">
               <path :d="item.icon" />
               <template v-if="item.dots">
                 <circle cx="6" cy="12" r="1.4" fill="currentColor" stroke="none" />
@@ -294,30 +509,6 @@ onMounted(() => {
         </li>
       </ul>
 
-      <!-- Get Bonus Credits -->
-      <button
-        type="button"
-        class="mt-3 flex items-center rounded-2xl bg-white/70 backdrop-blur-sm border border-white/80 hover:bg-white/85 transition text-left shadow-[0_1px_2px_rgba(90,80,60,0.04)]"
-        :class="collapsed ? 'justify-center p-2' : 'w-full gap-2.5 p-3'"
-        title="领取奖励额度"
-      >
-        <span class="h-8 w-8 shrink-0 grid place-items-center rounded-xl bg-gradient-to-br from-[#F3DFA8] to-[#B8975A] text-white">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="8" width="18" height="4" rx="1" />
-            <path d="M5 12v8h14v-8M12 8v12M12 8s-2-4-5-4a2.5 2.5 0 0 0 0 5M12 8s2-4 5-4a2.5 2.5 0 0 1 0 5" />
-          </svg>
-        </span>
-        <span v-if="!collapsed" class="min-w-0 flex-1 leading-tight">
-          <span class="block text-[12.5px] font-semibold text-[#2b2a22]">领取奖励额度</span>
-          <span class="block text-[11px] text-[#6d6a52] mt-0.5 truncate">
-            邀请好友，赢得额外用量
-          </span>
-        </span>
-        <svg v-if="!collapsed" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" class="text-[#6d6a52] shrink-0">
-          <path d="m9 6 6 6-6 6" />
-        </svg>
-      </button>
-
       <!-- 未登录：登录 / 免费注册 -->
       <div
         v-if="!isLoggedIn"
@@ -328,14 +519,14 @@ onMounted(() => {
           <button
             type="button"
             @click="openLogin"
-            class="flex-1 h-8 rounded-lg border border-[#cfc6ae] bg-white/70 text-[12.5px] font-medium text-[#2b2a22] hover:bg-white transition"
+            class="flex-1 h-9 rounded-lg border border-[#cfc6ae] bg-white/70 text-[12.5px] font-medium text-[#2b2a22] hover:bg-white transition"
           >
             登录
           </button>
           <button
             type="button"
             @click="openRegister"
-            class="flex-1 h-8 rounded-lg bg-[#333228] text-[12.5px] font-medium text-[#F7F3E4] hover:bg-[#4a4838] transition"
+            class="flex-1 h-9 rounded-lg bg-[#333228] text-[12.5px] font-medium text-[#F7F3E4] hover:bg-[#4a4838] transition"
           >
             免费注册
           </button>
@@ -371,20 +562,19 @@ onMounted(() => {
         class="mt-3 flex items-center"
         :class="collapsed ? 'flex-col gap-1.5' : 'gap-2 px-1'"
       >
-        <button
-          type="button"
-          class="h-8 w-8 shrink-0 rounded-full bg-gradient-to-br from-[#D9C9A3] to-[#7C9A5C] grid place-items-center text-[12px] font-semibold text-white"
-          :title="collapsed ? user?.username + ' · 点击退出' : undefined"
-          @click="logout"
+        <div
+          class="h-9 w-9 shrink-0 rounded-full bg-gradient-to-br from-[#D9C9A3] to-[#7C9A5C] grid place-items-center text-[12px] font-semibold text-white"
+          :title="user?.username"
         >
           {{ (user?.username || '?').charAt(0).toUpperCase() }}
-        </button>
+        </div>
         <span v-if="!collapsed" class="min-w-0 flex-1 leading-tight">
-          <span class="block text-[12.5px] font-semibold text-[#2b2a22] truncate">{{ user?.username }}</span>
+          <span class="block text-[12.5px] font-medium text-[#2b2a22] truncate">{{ user?.username }}</span>
           <span class="block text-[10.5px] text-[#6d6a52] truncate">{{ user?.email }}</span>
         </span>
+        <!-- 模型配置（密钥）只有管理员能改，普通用户看不到这个入口 -->
         <button
-          v-if="!collapsed"
+          v-if="!collapsed && isAdmin"
           type="button"
           @click="openSettings"
           class="h-7 w-7 grid place-items-center rounded-lg text-[#5b5945] hover:bg-white/60 transition"

@@ -29,11 +29,13 @@ class UserOut(BaseModel):
     username: str
     email: str
     is_active: bool
+    is_admin: bool = False
     created_at: datetime
 
 
 class Token(BaseModel):
-    """登录成功后返回的访问令牌"""
+    """登录/刷新成功后返回的访问令牌"""
 
     access_token: str
     token_type: str = "bearer"
+    expires_in: int | None = None  # access token 剩余秒数，供前端预刷新，旧客户端可忽略

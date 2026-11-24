@@ -18,6 +18,8 @@ from auth.config import get_settings
 from auth.database import Base
 import auth.models  # noqa: F401  确保所有模型注册到 Base.metadata
 import app.settings.models  # noqa: F401  将 llm_providers 表纳入迁移管理
+import app.session.models  # noqa: F401  将 chat_sessions / chat_messages 表纳入迁移管理
+import app.workspace.models  # noqa: F401  将 workspaces 表纳入迁移管理
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

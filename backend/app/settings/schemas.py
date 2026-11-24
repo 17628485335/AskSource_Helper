@@ -1,6 +1,6 @@
 """设置模块的 Pydantic 请求 / 响应模型"""
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ProviderWrite(BaseModel):
@@ -13,6 +13,17 @@ class ProviderWrite(BaseModel):
     default_model: str = Field(default="", max_length=128)
     supports_thinking: bool = False
     is_active: bool = False
+
+    @field_validator("platform", "name", "base_url", "api_key", "default_model", mode="before")
+    @classmethod
+    def _strip(cls, value: object) -> object:
+        """写入端就把首尾空格洗掉。
+
+        ChatManager 建池用的是 strip 后的 (平台, 模型)，而 /settings/models 返回的是列原值；
+        库里存了「 qwen-plus 」时，下拉里能选到它，传回 /chat 就对不上池里的键，
+        表现为「未接入模型」。在唯一写入口收紧，比在每个读取端各自补 strip 可靠。
+        """
+        return value.strip() if isinstance(value, str) else value
 
 
 class LlmProvidersUpdate(BaseModel):
@@ -36,8 +47,30 @@ class ProviderOut(BaseModel):
     is_active: bool
 
 
+class ChatModelOption(BaseModel):
+    """GET /settings/models 响应元素：给对话框选模型用，不携带任何密钥字段"""
+
+    platform: str
+    platform_label: str
+    model: str
+    name: str = ""
+    supports_thinking: bool = Field(
+        default=False,
+        description="该行是否有深度档位：前端据此决定是否展示 快速/深度 选择",
+    )
+    is_active: bool = False
+    available: bool = Field(
+        default=True,
+        description="该行是否真的建进了模型池：false 表示配置还在表里但构建失败，前端应置灰",
+    )
+    unavailable_reason: str = Field(
+        default="",
+        description="available=false 时的原因（取自模型池的 errors），供前端提示管理员",
+    )
+
+
 class ProviderTestRequest(BaseModel):
-    """POST /settings/llm/test 请求体：用表单草稿值探测，无需先保存"""
+    """POST /settings/llm/test 请求体：用表单草稿值探测，无需先保存（仅管理员）"""
 
     base_url: str = Field(default="", max_length=512)
     api_key: str = Field(default="", max_length=512)

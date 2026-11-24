@@ -2,7 +2,11 @@
  * LLM 配置存储（组合式单例）
  *
  * 管理各平台（DeepSeek / 硅基流动 / 阿里百炼 / 自定义）的接入配置。
- * 通过 /settings/llm 接口持久化到后端数据库（需登录），不再使用 localStorage。
+ * 通过 /settings/llm 接口持久化到后端数据库，不再使用 localStorage。
+ *
+ * 这张表现在是「全局一份」（不再是每用户一份），只有管理员能读写：
+ * 一行 = 一个可对话的模型，同平台可以接多行（多个模型）。普通用户拉只会拿到 403，
+ * 他们看的是 /settings/models（见 stores/models.ts）。
  */
 
 import { readonly, ref } from 'vue'
@@ -53,6 +57,11 @@ const providers = ref<LlmProviderConfig[]>([])
 const activeId = ref<string | null>(null)
 const loading = ref(false)
 const saving = ref(false)
+/** 上一次保存失败的原因（包后端 detail，如「只有管理员可以配置模型密钥」） */
+const saveError = ref('')
+/** 拉取现有配置失败的原因。PUT 是整表替换，载错/载空后继续写回会把库里其它行清空，
+ * 设置界面靠它禁用保存（仅管理员会触发 load，403 不在此列） */
+const loadError = ref('')
 
 function uid(): string {
   return Math.random().toString(36).slice(2, 10)
@@ -84,9 +93,10 @@ function toDto(p: LlmProviderConfig): LlmProviderDto {
   }
 }
 
-/** 从后端 /settings/llm 载入当前登录用户的配置（需登录） */
+/** 从后端 /settings/llm 载入全局配置（仅管理员能读） */
 async function load(): Promise<void> {
   loading.value = true
+  loadError.value = ''
   try {
     const list = await getLlmProviders()
     providers.value = list.map(fromDto)
@@ -94,25 +104,32 @@ async function load(): Promise<void> {
       providers.value.find((p) => list.find((d) => String(d.id) === p.id)?.is_active)?.id ??
       providers.value[0]?.id ??
       null
-  } catch {
-    // 未登录或后端不可用时保持空态，不阻断界面
+  } catch (e) {
+    // 失败时不清 providers（保留本地已有态），但必须记下错误：
+    // 后端不可达时 providers 可能停在空态，此时保存=用空表覆盖全库
+    loadError.value = e instanceof Error ? e.message : '加载模型配置失败'
   } finally {
     loading.value = false
   }
 }
 
-/** 将当前配置整表写回后端数据库（需登录） */
+/** 将当前配置整表写回后端数据库（仅管理员） */
 async function saveAll(): Promise<boolean> {
   saving.value = true
+  saveError.value = ''
   try {
     const list = await putLlmProviders(providers.value.map(toDto))
+    // 写回成功说明后端可达，且返回的整表已回填本地（两边一致），
+    // 载失败时的禁用态到此解除
+    loadError.value = ''
     // 用后端返回的真实 id 回填本地，保证后续更新一致
     providers.value = list.map(fromDto)
     activeId.value = list.find((d) => d.is_active)?.id != null
       ? String(list.find((d) => d.is_active)!.id)
       : providers.value[0]?.id ?? null
     return true
-  } catch {
+  } catch (e) {
+    saveError.value = e instanceof Error ? e.message : '保存失败'
     return false
   } finally {
     saving.value = false
@@ -170,6 +187,8 @@ export function useLlm() {
     activeId: readonly(activeId),
     loading: readonly(loading),
     saving: readonly(saving),
+    saveError: readonly(saveError),
+    loadError: readonly(loadError),
     load,
     saveAll,
     addProvider,

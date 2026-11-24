@@ -2,8 +2,11 @@
 
 密码用 bcrypt 直接哈希（不依赖 passlib，规避其与新版 bcrypt 的兼容问题）。
 令牌用 PyJWT 生成标准的 HS256 access token。
+刷新令牌为不透明随机串，DB 只存其 sha256 哈希。
 """
 
+import hashlib
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -51,3 +54,13 @@ def decode_access_token(token: str) -> dict[str, Any]:
         settings.jwt_secret_key,
         algorithms=[settings.jwt_algorithm],
     )
+
+
+def generate_refresh_token() -> str:
+    """生成不透明刷新令牌（url-safe 随机串），原文只下发给客户端 Cookie，DB 只存哈希"""
+    return secrets.token_urlsafe(48)
+
+
+def hash_token(raw: str) -> str:
+    """对令牌取 sha256 十六进制摘要；DB 泄露时无法反推出可用令牌"""
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()

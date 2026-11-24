@@ -2,7 +2,7 @@
  * 设置类接口封装：对接后端 /settings/*（开发环境经 Vite 代理到 FastAPI）
  */
 
-import { ApiError, getToken } from './auth'
+import { ApiError, ensureFreshToken, getToken } from './auth'
 
 export interface ModelProviderOption {
   value: string
@@ -38,6 +38,8 @@ export async function getModelProviders(): Promise<ModelProviderOption[]> {
 
 /** 携带 JWT 的 /settings/llm 请求；错误以 ApiError 抛出 */
 async function llmRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
+  // 同样是手写 fetch，不进 request() 的 401 重试链路，发之前先确保 token 没到期
+  await ensureFreshToken()
   const token = getToken()
   let res: Response
   try {
@@ -62,17 +64,36 @@ async function llmRequest<T>(path: string, options: RequestInit = {}): Promise<T
   return data as T
 }
 
-/** 获取当前登录用户的 LLM 配置 */
+/** 获取全局 LLM 配置（含 api_key，仅管理员；普通用户会得到 403） */
 export function getLlmProviders(): Promise<LlmProviderDto[]> {
   return llmRequest<LlmProviderDto[]>('/settings/llm')
 }
 
-/** 整表替换当前登录用户的 LLM 配置 */
+/** 整表替换全局 LLM 配置（仅管理员：这张表影响所有用户的对话） */
 export function putLlmProviders(providers: LlmProviderDto[]): Promise<LlmProviderDto[]> {
   return llmRequest<LlmProviderDto[]>('/settings/llm', {
     method: 'PUT',
     body: JSON.stringify({ providers }),
   })
+}
+
+/** 对话框可选的模型（后端 /settings/models：登录即可读，响应里不含密钥） */
+export interface ChatModelOption {
+  platform: string
+  platform_label: string
+  model: string
+  name: string
+  supports_thinking: boolean
+  is_active: boolean
+  /** 该行是否真的建进了模型池；false 表示配置还在表里但构建失败，下拉里该置灰 */
+  available: boolean
+  /** available 为 false 时的原因，给标题提示用 */
+  unavailable_reason: string
+}
+
+/** 拉取对话可选的模型列表 */
+export function getChatModels(): Promise<ChatModelOption[]> {
+  return llmRequest<ChatModelOption[]>('/settings/models')
 }
 
 /** 连通性测试结果（与后端 ProviderTestResult 对齐） */
