@@ -1,0 +1,3 @@
+# 依赖清单（示例，可按需扩展）
+# 生产依赖请通过 pyproject.toml 的 [project.dependencies] 维护
+# 开发依赖请通过 pyproject.toml 的 [project.optional-dependencies.dev] 维护

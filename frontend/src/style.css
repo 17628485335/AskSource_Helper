@@ -1,0 +1,42 @@
+@import 'tailwindcss';
+
+/* 全局基础：柔和浅米黄底、细滚动条 */
+:root {
+  --page-bg: #f5f1e8;
+  --card-border: #e7e2d5;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--page-bg);
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 极简细滚动条 */
+.scroll-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: #dcd5c4;
+  border-radius: 9999px;
+}
+.scroll-thin::-webkit-scrollbar-thumb:hover {
+  background: #c9c0ab;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: #dcd5c4 transparent;
+}
