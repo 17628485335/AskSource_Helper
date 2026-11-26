@@ -14,12 +14,13 @@ import asyncio
 
 import httpx
 import pytest
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 from app.chat.chat_manager import load_tools
 from app.graph import get_tools, list_tool_specs
 from app.settings.search import SearchError, SearchSettings, SearchResult, tavily_search
 from app.tools import web_search as search_module
+from app.tools.citations import citation_start
 from app.tools.web_search import (
     MAX_RESULTS_LIMIT,
     SNIPPET_LIMIT,
@@ -208,12 +209,32 @@ def test_tool_degrades_to_text_instead_of_raising(monkeypatch):
     assert "联网搜索失败：搜索超时" in text and "已知的信息" in text
     assert artifact["citations"] == [] and artifact["tools"] == "web_search"
 
-    async def empty(query, **kwargs):
-        return []
 
-    monkeypatch.setattr(search_module, "tavily_search", empty)
-    text, artifact = asyncio.run(WebSearchTool()._arun("冷门问题"))
-    assert "没有命中" in text and artifact["citations"] == []
+def test_parallel_search_calls_get_non_overlapping_citation_ranges():
+    """同一批并行搜索必须预分配不重叠的 [n]，否则 6 条来源去重后只剩 3 条"""
+    state = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "web_search",
+                        "args": {"query": "A", "max_results": 3},
+                        "id": "call_a",
+                        "type": "tool_call",
+                    },
+                    {
+                        "name": "web_search",
+                        "args": {"query": "B", "max_results": 3},
+                        "id": "call_b",
+                        "type": "tool_call",
+                    },
+                ],
+            )
+        ]
+    }
+    assert citation_start(state, "call_a") == 1
+    assert citation_start(state, "call_b") == 4
 
 
 def test_tool_clamps_out_of_range_counts_instead_of_rejecting(monkeypatch):

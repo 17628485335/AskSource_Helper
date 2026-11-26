@@ -2,22 +2,38 @@
 import { computed, ref, watch } from 'vue'
 import { useLlm, PLATFORM_PRESET, type LlmProviderConfig } from '../stores/llm'
 import { useAuth } from '../stores/auth'
+import * as authApi from '../api/auth'
 import { useModels } from '../stores/models'
 import {
   activateAgentPrompt,
+  composeSystemPrompt,
   createAgent,
+  createAgentBinding,
+  createAgentDoc,
+  createAgentMemory,
   createAgentPrompt,
   deleteAgent,
-  getChatModels,
+  deleteAgentMemory,
+  generateContextContent,
   getModelProviders,
+  listAgentBindings,
+  listAgentDocs,
+  listAgentMemories,
   listAgentPrompts,
   listAgents,
   listTools,
   testLlmProvider,
   updateAgent,
+  updateAgentBinding,
+  updateAgentDoc,
+  updateAgentMemory,
+  type AgentContextDocDto,
+  type AgentMemoryDto,
   type AgentDto,
   type AgentPromptDto,
-  type ChatModelOption,
+  type ContextGenerateKind,
+  type ContextResolver,
+  type ContextTrustLevel,
   type LlmTestResult,
   type ToolDto,
 } from '../api/settings'
@@ -27,7 +43,7 @@ import { useAgents } from '../stores/agents'
 const open = defineModel<boolean>({ required: true })
 
 const { providers, activeId, addProvider, updateProvider, removeProvider, setActive, saveAll, saving, load, loading: loadingLlm, loadError, saveError: lastSaveError } = useLlm()
-const { user, isLoggedIn, isAdmin, logout } = useAuth()
+const { user, isLoggedIn, isAdmin, logout, setUser } = useAuth()
 // 保存成功后作废对话框模型列表的缓存，让刚接入的模型立刻可选
 const { load: loadModels } = useModels()
 // 保存 agent 配置后立刻刷新对话区可选列表
@@ -37,7 +53,7 @@ type NavKey = 'account' | 'general' | 'model' | 'plugins' | 'agent'
 type Platform = LlmProviderConfig['platform']
 
 const NAV_ITEMS: { key: NavKey; label: string }[] = [
-  { key: 'account', label: '账号与余额' },
+  { key: 'account', label: '账户' },
   { key: 'general', label: '通用设置' },
   { key: 'model', label: '模型' },
   { key: 'plugins', label: '内置插件' },
@@ -78,7 +94,6 @@ const supportsThinking = ref(true)
 const adminAgents = ref<AgentDto[]>([])
 const adminPrompts = ref<AgentPromptDto[]>([])
 const agentTools = ref<ToolDto[]>([])
-const agentModels = ref<ChatModelOption[]>([])
 const agentLoading = ref(false)
 const agentError = ref('')
 const agentSaved = ref('')
@@ -87,28 +102,255 @@ const agentEditingId = ref<number | null>(null)
 const agKey = ref('')
 const agName = ref('')
 const agDescription = ref('')
-const agPlatform = ref('')
-const agModel = ref('')
-const agThinking = ref(false)
 const agToolMode = ref<'all' | 'picked'>('all')
 const agToolNames = ref<string[]>([])
 const agPrompt = ref('')
 const agPromptNote = ref('')
-const agentPlatforms = computed(() => [...new Set(agentModels.value.map((m) => m.platform))])
+const systemPromptGenerating = ref(false)
+const systemPromptSaving = ref(false)
+const systemPromptError = ref('')
+
+interface ContextDraft {
+  localId: number
+  bindingId: number | null
+  docId: number | null
+  key: string
+  title: string
+  resolver: ContextResolver
+  refKey: string
+  content: string
+  enabled: boolean
+  priority: number
+  maxTokens: number
+  trustLevel: ContextTrustLevel
+  trustHint: string
+  globalDoc: boolean
+}
+
+interface ContextPreset {
+  key: string
+  title: string
+  description: string
+  resolver: ContextResolver
+  refKey: string
+  priority: number
+  maxTokens: number
+  trustLevel: ContextTrustLevel
+  trustHint: string
+  enabled: boolean
+}
+
+const CONTEXT_PRESETS: Record<'agent' | 'user' | 'memory', ContextPreset[]> = {
+  agent: [
+    {
+      key: 'identity',
+      title: 'Identity',
+      description: '定义 Agent 是谁、能做什么、不能做什么，例如名称、角色定位和服务边界。用户问「你是谁」时以此为准；按 anchor 级注入，作为事实锚点，不作为规则执行。',
+      resolver: 'agent_doc',
+      refKey: 'identity',
+      priority: 10,
+      maxTokens: 800,
+      trustLevel: 'anchor',
+      trustHint: '事实锚点',
+      enabled: true,
+    },
+    {
+      key: 'soul',
+      title: 'Soul',
+      description: '定义这个 Agent 的性格、语气与行为底线，例如「先给结论，再展开解释」「不使用感叹号」。按 policy 级注入，模型会当作规则遵循；建议只写 3～10 条短规则，预算 1000 token。',
+      resolver: 'agent_doc',
+      refKey: 'soul',
+      priority: 20,
+      maxTokens: 1000,
+      trustLevel: 'policy',
+      trustHint: '可作为规则遵循',
+      enabled: true,
+    },
+    {
+      key: 'agents_guide',
+      title: 'Agents Guide',
+      description: '每个 Agent 自己的工作指南，例如工具调用时机、引用怎么标 [n]、回答分段结构。按 policy 级注入，模型会当作规则遵循；内容保存在当前 Agent 名下，修改只影响这个 Agent。',
+      resolver: 'agent_doc',
+      refKey: 'agents_guide',
+      priority: 30,
+      maxTokens: 2000,
+      trustLevel: 'policy',
+      trustHint: '可作为规则遵循',
+      enabled: true,
+    },
+    {
+      key: 'skills_snapshot',
+      title: 'Skills Snapshot',
+      description: '按当前 Agent 的工具白名单实时生成能力快照，不落库正文；随工具配置变化自动更新。按 generated 级注入，作为能力清单，仅作事实参考，不作为规则或指令执行。',
+      resolver: 'generated',
+      refKey: 'skills_snapshot',
+      priority: 40,
+      maxTokens: 1200,
+      trustLevel: 'generated',
+      trustHint: '能力清单，仅作事实参考',
+      enabled: true,
+    },
+  ],
+  user: [
+    {
+      key: 'user_profile',
+      title: 'User Profile',
+      description: '目标用户的稳定事实与偏好，例如称呼、语言、职业、常用术语。内容由当前 Agent 维护，注入时标为 user data，模型只当事实参考，不把它当指令执行。',
+      resolver: 'agent_doc',
+      refKey: 'user_profile',
+      priority: 50,
+      maxTokens: 1200,
+      trustLevel: 'data',
+      trustHint: '仅作事实参考，不作为指令执行',
+      enabled: true,
+    },
+  ],
+  memory: [
+    {
+      key: 'long_term_memory',
+      title: 'Long-term Memory',
+      description: '跨会话保留的稳定记忆，例如用户反复提到的长期目标或项目背景。后端写入链路尚未实现，这里只是预留配置位，默认关闭；后续阶段实现后会自动按这里配置的优先级和 2000 token 预算注入。',
+      resolver: 'memory',
+      refKey: 'long_term_memory',
+      priority: 60,
+      maxTokens: 2000,
+      trustLevel: 'data',
+      trustHint: '仅作事实参考，不作为指令执行',
+      enabled: false,
+    },
+  ],
+}
+
+/** 目标拼接顺序；旧库还没跑迁移时，靠旧 priority 识别出需要临时纠正的显示顺序 */
+const CONTEXT_ORDER_KEYS = [
+  'identity',
+  'soul',
+  'agents_guide',
+  'skills_snapshot',
+  'user_profile',
+  'long_term_memory',
+]
+const LEGACY_CONTEXT_PRIORITY: Record<string, number> = {
+  skills_snapshot: 10,
+  soul: 20,
+  identity: 30,
+  agents_guide: 40,
+  user_profile: 50,
+  long_term_memory: 60,
+}
+
+function sortContextDrafts(drafts: ContextDraft[]): ContextDraft[] {
+  const relevant = drafts.filter((d) => d.key in LEGACY_CONTEXT_PRIORITY)
+  const looksLegacy =
+    relevant.length > 0 &&
+    relevant.every((d) => d.priority === LEGACY_CONTEXT_PRIORITY[d.key])
+  return drafts.slice().sort((a, b) => {
+    if (looksLegacy) {
+      const ai = CONTEXT_ORDER_KEYS.indexOf(a.key)
+      const bi = CONTEXT_ORDER_KEYS.indexOf(b.key)
+      const ao = ai < 0 ? CONTEXT_ORDER_KEYS.length : ai
+      const bo = bi < 0 ? CONTEXT_ORDER_KEYS.length : bi
+      if (ao !== bo) return ao - bo
+    }
+    return a.priority - b.priority || a.localId - b.localId
+  })
+}
+
+const contextDrafts = ref<ContextDraft[]>([])
+const agentContextDocs = ref<AgentContextDocDto[]>([])
+let contextDraftSeq = 0
+
+interface ContextGroup {
+  key: 'agent' | 'user' | 'memory'
+  label: string
+  description: string
+  addResolver: ContextResolver
+  drafts: ContextDraft[]
+}
+
+const USER_CONTEXT_KEYS = ['user_profile']
+const MEMORY_CONTEXT_KEYS = ['long_term_memory']
+
+const contextGroups = computed<ContextGroup[]>(() => [
+  {
+    key: 'agent',
+    label: 'Agent 上下文',
+    description: 'Agent 自己的规则与能力快照；Agent 文档可直接编辑内容。',
+    addResolver: 'agent_doc',
+    drafts: contextDrafts.value.filter(
+      (d) => !USER_CONTEXT_KEYS.includes(d.key) && !MEMORY_CONTEXT_KEYS.includes(d.key),
+    ),
+  },
+  {
+    key: 'user',
+    label: '用户上下文',
+    description: '目标用户的画像与偏好；作为事实参考注入，不作为规则遵循。',
+    addResolver: 'agent_doc',
+    drafts: contextDrafts.value.filter((d) => USER_CONTEXT_KEYS.includes(d.key)),
+  },
+  {
+    key: 'memory',
+    label: '长期记忆',
+    description: '跨会话记忆，当前为预留位；只能配置是否注入与预算。',
+    addResolver: 'memory',
+    drafts: contextDrafts.value.filter(
+      (d) => MEMORY_CONTEXT_KEYS.includes(d.key) || d.resolver === 'memory',
+    ),
+  },
+])
+
+const contextPickerGroup = ref<'agent' | 'user' | 'memory' | null>(null)
+const activePresets = computed(() =>
+  contextPickerGroup.value ? CONTEXT_PRESETS[contextPickerGroup.value] : [],
+)
+const contextPickerLabel = computed(
+  () => contextGroups.value.find((g) => g.key === contextPickerGroup.value)?.label ?? '',
+)
+const generatingContext = ref<number | null>(null)
+const contextGenerateError = ref('')
+const contextSaving = ref<Record<'agent' | 'user' | 'memory', boolean>>({
+  agent: false,
+  user: false,
+  memory: false,
+})
+const contextSaved = ref<Record<'agent' | 'user' | 'memory', string>>({
+  agent: '',
+  user: '',
+  memory: '',
+})
+/** 上下文拼接顺序：拖动调整 contextDrafts 的数组顺序，保存时写回 priority */
+const orderDraggingId = ref<number | null>(null)
+const orderDropIndex = ref<number | null>(null)
+const orderDirty = ref(false)
+const orderSaving = ref(false)
+const orderSaved = ref('')
+const orderError = ref('')
+const memoryDrafts = ref<AgentMemoryDto[]>([])
+
+const GENERATE_LABELS: Record<ContextGenerateKind, string> = {
+  soul: '自动生成人格',
+  identity: '自动生成身份',
+  agents_guide: '自动生成指南',
+  user_profile: '自动生成用户资料',
+}
 
 function resetAgentForm() {
   agentEditingId.value = null
   agKey.value = ''
   agName.value = ''
   agDescription.value = ''
-  agPlatform.value = ''
-  agModel.value = ''
-  agThinking.value = false
   agToolMode.value = 'all'
   agToolNames.value = []
   agPrompt.value = ''
   agPromptNote.value = ''
+  systemPromptError.value = ''
   adminPrompts.value = []
+  contextDrafts.value = []
+  agentContextDocs.value = []
+  memoryDrafts.value = []
+  orderDirty.value = false
+  orderSaved.value = ''
+  orderError.value = ''
   agentSaved.value = ''
   agentError.value = ''
 }
@@ -118,14 +360,12 @@ async function loadAdminAgentData() {
   agentLoading.value = true
   agentError.value = ''
   try {
-    const [list, tools, models] = await Promise.all([
+    const [list, tools] = await Promise.all([
       listAgents(true),
       listTools(),
-      getChatModels(),
     ])
     adminAgents.value = list
     agentTools.value = tools
-    agentModels.value = models
   } catch (e) {
     agentError.value = e instanceof Error ? e.message : '加载 Agent 配置失败'
   } finally {
@@ -141,22 +381,376 @@ async function loadAgentPrompts(id: number) {
   }
 }
 
+async function loadAgentContext(agentId: number) {
+  contextGenerateError.value = ''
+  try {
+    const [bindings, docs, memories] = await Promise.all([
+      listAgentBindings(agentId),
+      listAgentDocs(agentId),
+      listAgentMemories(agentId),
+    ])
+    agentContextDocs.value = docs
+    memoryDrafts.value = memories
+    contextDrafts.value = sortContextDrafts(
+      bindings.map((b) => {
+        const refKey = b.ref_key || b.key
+        const doc =
+          docs.find((d) => d.agent_id === agentId && d.key === refKey) ?? null
+        return {
+          localId: ++contextDraftSeq,
+          bindingId: b.id,
+          docId: doc?.id ?? null,
+          key: b.key,
+          title: b.title,
+          resolver: b.resolver,
+          refKey,
+          content: doc?.content ?? '',
+          enabled: b.enabled,
+          priority: b.priority,
+          maxTokens: b.max_tokens,
+          trustLevel: b.trust_level,
+          trustHint: b.trust_hint,
+          globalDoc: doc?.agent_id === null,
+        }
+      }),
+    )
+    // 这两个分段不依赖手动添加：Skills Snapshot 由工具注册表生成，Long-term Memory 由记忆列表供数。
+    // 若 Agent 还没有对应 binding，补一条草稿，保证它们始终出现在拼接顺序列表里。
+    for (const key of ['skills_snapshot', 'long_term_memory']) {
+      if (contextDrafts.value.some((d) => d.key === key)) continue
+      const preset =
+        CONTEXT_PRESETS.agent.find((p) => p.key === key) ??
+        CONTEXT_PRESETS.memory.find((p) => p.key === key)
+      if (!preset) continue
+      contextDrafts.value.push({
+        localId: ++contextDraftSeq,
+        bindingId: null,
+        docId: null,
+        key: preset.key,
+        title: preset.title,
+        resolver: preset.resolver,
+        refKey: preset.refKey,
+        content: '',
+        enabled: preset.enabled,
+        priority: preset.priority,
+        maxTokens: preset.maxTokens,
+        trustLevel: preset.trustLevel,
+        trustHint: preset.trustHint,
+        globalDoc: false,
+      })
+    }
+    contextDrafts.value = sortContextDrafts(contextDrafts.value)
+    orderDirty.value = false
+    orderSaved.value = ''
+    orderError.value = ''
+  } catch (e) {
+    agentContextDocs.value = []
+    contextDrafts.value = []
+    memoryDrafts.value = []
+    contextGenerateError.value = e instanceof Error ? `加载上下文失败：${e.message}` : '加载上下文失败'
+  }
+}
+
+function addPresetContext(preset: ContextPreset) {
+  if (contextDrafts.value.some((d) => d.key === preset.key)) return
+  const agentId = agentEditingId.value
+  const doc =
+    agentContextDocs.value.find((d) => d.agent_id === agentId && d.key === preset.refKey) ?? null
+  contextDrafts.value.push({
+    localId: ++contextDraftSeq,
+    bindingId: null,
+    docId: doc?.id ?? null,
+    key: preset.key,
+    title: preset.title,
+    resolver: preset.resolver,
+    refKey: preset.refKey,
+    content: doc?.content ?? '',
+    enabled: preset.enabled,
+    priority: preset.priority,
+    maxTokens: preset.maxTokens,
+    trustLevel: preset.trustLevel,
+    trustHint: preset.trustHint,
+    globalDoc: doc?.agent_id === null,
+  })
+  contextPickerGroup.value = null
+}
+
+function presetDescription(draft: ContextDraft): string {
+  for (const presets of Object.values(CONTEXT_PRESETS)) {
+    const preset = presets.find((p) => p.key === draft.key)
+    if (preset) return preset.description
+  }
+  return '自定义上下文分段。'
+}
+
+function generateButtonLabel(key: string): string {
+  return GENERATE_LABELS[key as ContextGenerateKind] ?? '自动生成'
+}
+
+async function generateDraftContent(draft: ContextDraft) {
+  const kind = draft.key as ContextGenerateKind
+  if (!(kind in GENERATE_LABELS)) return
+  generatingContext.value = draft.localId
+  contextGenerateError.value = ''
+  try {
+    const result = await generateContextContent({
+      kind,
+      agent_id: agentEditingId.value,
+      current: draft.content,
+    })
+    // draft 来自 computed 过滤后的数组引用；通过原数组按 localId 回写，确保响应式更新
+    const target = contextDrafts.value.find((item) => item.localId === draft.localId)
+    const content = typeof result?.content === 'string' ? result.content : ''
+    if (target) target.content = content
+    else draft.content = content
+    agentSaved.value = ''
+  } catch (e) {
+    contextGenerateError.value = e instanceof Error ? e.message : '生成失败'
+  } finally {
+    generatingContext.value = null
+  }
+}
+
+async function generateSystemPrompt() {
+  if (systemPromptGenerating.value) return
+  systemPromptGenerating.value = true
+  systemPromptError.value = ''
+  try {
+    const selectedTools =
+      agToolMode.value === 'picked'
+        ? agToolNames.value
+        : agentTools.value.map((t) => t.name)
+    const result = await composeSystemPrompt({
+      prompt: agPrompt.value,
+      agent_id: agentEditingId.value,
+      tool_names: selectedTools,
+    })
+    agPrompt.value = result.content
+    agentSaved.value = ''
+  } catch (e) {
+    systemPromptError.value = e instanceof Error ? e.message : '生成系统提示词失败'
+  } finally {
+    systemPromptGenerating.value = false
+  }
+}
+
+async function saveSystemPromptPreview() {
+  const id = agentEditingId.value
+  if (id === null || !agPrompt.value.trim() || systemPromptSaving.value) return
+  systemPromptSaving.value = true
+  systemPromptError.value = ''
+  try {
+    await createAgentPrompt(id, {
+      system_prompt: agPrompt.value,
+      note: agPromptNote.value.trim() || undefined,
+      activate: true,
+    })
+    await loadAdminAgentData()
+    await loadAgentPrompts(id)
+    void loadChatAgents(true)
+    agentSaved.value = '已保存系统提示词并发布新版本'
+    agPromptNote.value = ''
+  } catch (e) {
+    systemPromptError.value = e instanceof Error ? e.message : '保存系统提示词失败'
+  } finally {
+    systemPromptSaving.value = false
+  }
+}
+
+function removeContextDraft(localId: number) {
+  contextDrafts.value = contextDrafts.value.filter((d) => d.localId !== localId)
+}
+
+function moveContextDraft(from: number, to: number) {
+  const drafts = contextDrafts.value
+  if (from < 0 || to < 0 || from >= drafts.length || to >= drafts.length || from === to) return
+  const reordered = drafts.slice()
+  const [moved] = reordered.splice(from, 1)
+  reordered.splice(to, 0, moved)
+  contextDrafts.value = reordered
+  orderDirty.value = true
+  orderSaved.value = ''
+  orderError.value = ''
+}
+
+function onOrderDragStart(event: DragEvent, index: number) {
+  orderDraggingId.value = contextDrafts.value[index]?.localId ?? null
+  orderDropIndex.value = index
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', String(index))
+  }
+}
+
+function onOrderDragOver(event: DragEvent, index: number) {
+  if (orderDraggingId.value === null) return
+  event.preventDefault()
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
+  orderDropIndex.value = index
+}
+
+function onOrderDrop(event: DragEvent, index: number) {
+  if (orderDraggingId.value === null) return
+  event.preventDefault()
+  const from = contextDrafts.value.findIndex((d) => d.localId === orderDraggingId.value)
+  moveContextDraft(from, index)
+  onOrderDragEnd()
+}
+
+function onOrderDragEnd() {
+  orderDraggingId.value = null
+  orderDropIndex.value = null
+}
+
+async function addMemoryDraft() {
+  if (agentEditingId.value === null) return
+  contextGenerateError.value = ''
+  try {
+    const created = await createAgentMemory(agentEditingId.value, '')
+    memoryDrafts.value.push(created)
+    contextSaved.value.memory = '已新增空白记忆'
+  } catch (e) {
+    contextGenerateError.value = e instanceof Error ? e.message : '新增记忆失败'
+  }
+}
+
+async function updateMemoryContent(memory: AgentMemoryDto, content: string) {
+  if (agentEditingId.value === null) return
+  contextGenerateError.value = ''
+  try {
+    const updated = await updateAgentMemory(agentEditingId.value, memory.id, { content })
+    const index = memoryDrafts.value.findIndex((m) => m.id === memory.id)
+    if (index >= 0) memoryDrafts.value[index] = updated
+  } catch (e) {
+    contextGenerateError.value = e instanceof Error ? e.message : '保存记忆失败'
+  }
+}
+
+async function toggleMemoryEnabled(memory: AgentMemoryDto, enabled: boolean) {
+  if (agentEditingId.value === null) return
+  contextGenerateError.value = ''
+  try {
+    const updated = await updateAgentMemory(agentEditingId.value, memory.id, { enabled })
+    const index = memoryDrafts.value.findIndex((m) => m.id === memory.id)
+    if (index >= 0) memoryDrafts.value[index] = updated
+  } catch (e) {
+    contextGenerateError.value = e instanceof Error ? e.message : '更新记忆状态失败'
+  }
+}
+
+async function removeMemoryDraft(memory: AgentMemoryDto) {
+  if (agentEditingId.value === null) return
+  contextGenerateError.value = ''
+  try {
+    await deleteAgentMemory(agentEditingId.value, memory.id)
+    memoryDrafts.value = memoryDrafts.value.filter((m) => m.id !== memory.id)
+  } catch (e) {
+    contextGenerateError.value = e instanceof Error ? e.message : '删除记忆失败'
+  }
+}
+
+async function saveContextGroup(groupKey: 'agent' | 'user' | 'memory') {
+  if (agentEditingId.value === null || contextSaving.value[groupKey]) return
+  const drafts = contextGroups.value.find((g) => g.key === groupKey)?.drafts ?? []
+  if (!drafts.length) return
+  contextSaving.value[groupKey] = true
+  contextSaved.value[groupKey] = ''
+  contextGenerateError.value = ''
+  try {
+    await saveAgentContexts(agentEditingId.value, drafts)
+    contextSaved.value[groupKey] = '已保存'
+  } catch (e) {
+    contextGenerateError.value = e instanceof Error ? e.message : '保存上下文失败'
+  } finally {
+    contextSaving.value[groupKey] = false
+  }
+}
+
+async function saveAgentContexts(agentId: number, drafts: ContextDraft[] = contextDrafts.value) {
+  // 保存其它设置后会重新拉取分段；保留当前拖动顺序，避免未保存的顺序被覆盖
+  const previousOrder = contextDrafts.value.map((d) => d.key)
+  const keepOrderDirty = orderDirty.value
+  for (const draft of drafts) {
+    const key = draft.key.trim()
+    if (!/^[a-z][a-z0-9_]{1,63}$/.test(key)) {
+      throw new Error(`上下文分段 key 不合法：${key || '(空)'}`)
+    }
+    const refKey = draft.refKey.trim() || key
+    const fields = {
+      title: draft.title.trim(),
+      resolver: draft.resolver,
+      ref_key: refKey,
+      enabled: draft.enabled,
+      priority: draft.priority,
+      max_tokens: draft.maxTokens,
+      trust_level: draft.trustLevel,
+      trust_hint: draft.trustHint,
+    }
+    if (draft.bindingId === null) {
+      const created = await createAgentBinding(agentId, { key, ...fields })
+      draft.bindingId = created.id
+    } else {
+      await updateAgentBinding(draft.bindingId, fields)
+    }
+    if (draft.resolver === 'agent_doc') {
+      if (draft.docId !== null) {
+        await updateAgentDoc(draft.docId, { content: draft.content })
+      } else {
+        const createdDoc = await createAgentDoc({
+          agent_id: agentId,
+          key: refKey,
+          title: draft.title.trim(),
+          content: draft.content,
+        })
+        draft.docId = createdDoc.id
+      }
+    }
+  }
+  await loadAgentContext(agentId)
+  const byKey = new Map(contextDrafts.value.map((d) => [d.key, d]))
+  const restored = previousOrder
+    .map((key) => byKey.get(key))
+    .filter((d): d is ContextDraft => d !== undefined)
+  if (restored.length === contextDrafts.value.length) {
+    contextDrafts.value = restored
+    orderDirty.value = keepOrderDirty
+  }
+}
+
+async function saveContextOrder() {
+  if (agentEditingId.value === null || orderSaving.value || !contextDrafts.value.length) return
+  orderSaving.value = true
+  orderSaved.value = ''
+  orderError.value = ''
+  try {
+    contextDrafts.value.forEach((draft, index) => {
+      draft.priority = (index + 1) * 10
+    })
+    await saveAgentContexts(agentEditingId.value, contextDrafts.value)
+    orderDirty.value = false
+    orderSaved.value = '已保存拼接顺序'
+  } catch (e) {
+    orderError.value = e instanceof Error ? e.message : '保存拼接顺序失败'
+  } finally {
+    orderSaving.value = false
+  }
+}
+
 function editAgent(agent: AgentDto) {
   agentEditingId.value = agent.id
   agKey.value = agent.agent_key
   agName.value = agent.name
   agDescription.value = agent.description
-  agPlatform.value = agent.platform
-  agModel.value = agent.model
-  agThinking.value = agent.thinking
   agToolMode.value = agent.tool_names === null ? 'all' : 'picked'
   agToolNames.value = [...(agent.tool_names ?? [])]
   agPrompt.value = ''
   agPromptNote.value = ''
+  systemPromptError.value = ''
   agentSaved.value = ''
   agentError.value = ''
   agentFormOpen.value = true
   void loadAgentPrompts(agent.id)
+  void loadAgentContext(agent.id)
 }
 
 function toggleAgentTool(name: string) {
@@ -181,9 +775,6 @@ async function saveAgent() {
         agent_key: key,
         name: agName.value.trim(),
         description: agDescription.value.trim(),
-        platform: agPlatform.value.trim(),
-        model: agModel.value.trim(),
-        thinking: agThinking.value,
         tool_names: toolNames,
         system_prompt: prompt || undefined,
       })
@@ -192,9 +783,6 @@ async function saveAgent() {
       await updateAgent(agentEditingId.value, {
         name: agName.value.trim(),
         description: agDescription.value.trim(),
-        platform: agPlatform.value.trim(),
-        model: agModel.value.trim(),
-        thinking: agThinking.value,
         tool_names: toolNames,
         is_active: true,
       })
@@ -206,10 +794,14 @@ async function saveAgent() {
         })
       }
     }
+    if (agentEditingId.value !== null) {
+      await saveAgentContexts(agentEditingId.value)
+    }
     await loadAdminAgentData()
     await loadAgentPrompts(agentEditingId.value)
     void loadChatAgents(true)
-    agentSaved.value = prompt ? '已保存并发布新提示词版本' : '已保存'
+    agentSaved.value = prompt ? '已保存并发布新提示词版本（含上下文分段）' : '已保存（含上下文分段）'
+    orderDirty.value = false
     agPrompt.value = ''
     agPromptNote.value = ''
   } catch (e) {
@@ -485,7 +1077,7 @@ async function retryLoad() {
   if (!loadError.value) loadDraft()
 }
 
-/** 账号页退出登录：两步确认，避免误点；离开账号页或关闭弹窗时重置 */
+/** 账户页退出登录：两步确认，避免误点；离开账户页时重置 */
 const logoutConfirm = ref(false)
 
 function onLogout() {
@@ -497,8 +1089,137 @@ function onLogout() {
   close()
 }
 
+/* ---------------- 账户：昵称 / 头像 / 密码 ---------------- */
+const profileEditing = ref(false)
+const nicknameDraft = ref('')
+const avatarDraft = ref('')
+const profileSaving = ref(false)
+const profileError = ref('')
+const profileSaved = ref('')
+const avatarInput = ref<HTMLInputElement | null>(null)
+
+function startEditProfile() {
+  nicknameDraft.value = user.value?.nickname || user.value?.username || ''
+  avatarDraft.value = user.value?.avatar || ''
+  profileError.value = ''
+  profileSaved.value = ''
+  profileEditing.value = true
+}
+
+function cancelEditProfile() {
+  profileEditing.value = false
+  profileError.value = ''
+}
+
+function pickAvatar() {
+  avatarInput.value?.click()
+}
+
+/** 先把图片压到 160×160 的 JPEG，控制 data URL 体积（后端限量 2MB） */
+function onAvatarPicked(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  if (!file.type.startsWith('image/')) {
+    profileError.value = '请选择图片文件'
+    return
+  }
+  if (file.size > 5 * 1024 * 1024) {
+    profileError.value = '原图不能超过 5MB'
+    return
+  }
+  profileError.value = ''
+  const reader = new FileReader()
+  reader.onload = () => {
+    const img = new Image()
+    img.onload = () => {
+      const max = 160
+      const scale = Math.min(max / img.width, max / img.height, 1)
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.max(1, Math.round(img.width * scale))
+      canvas.height = Math.max(1, Math.round(img.height * scale))
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        profileError.value = '图片处理失败，请重试'
+        return
+      }
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+      avatarDraft.value = canvas.toDataURL('image/jpeg', 0.85)
+    }
+    img.src = String(reader.result)
+  }
+  reader.readAsDataURL(file)
+  input.value = ''
+}
+
+async function saveProfile() {
+  if (!nicknameDraft.value.trim()) {
+    profileError.value = '昵称不能为空'
+    return
+  }
+  profileSaving.value = true
+  profileError.value = ''
+  profileSaved.value = ''
+  try {
+    setUser(
+      await authApi.updateProfile({
+        nickname: nicknameDraft.value.trim(),
+        avatar: avatarDraft.value,
+      }),
+    )
+    profileEditing.value = false
+    profileSaved.value = '资料已更新'
+  } catch (e) {
+    profileError.value = e instanceof Error ? e.message : '保存失败'
+  } finally {
+    profileSaving.value = false
+  }
+}
+
+const oldPassword = ref('')
+const newPassword = ref('')
+const confirmPassword = ref('')
+const passwordSaving = ref(false)
+const passwordError = ref('')
+const passwordSaved = ref('')
+
+async function changePassword() {
+  passwordError.value = ''
+  passwordSaved.value = ''
+  if (!oldPassword.value || !newPassword.value) {
+    passwordError.value = '请填写当前密码和新密码'
+    return
+  }
+  if (newPassword.value !== confirmPassword.value) {
+    passwordError.value = '两次输入的新密码不一致'
+    return
+  }
+  passwordSaving.value = true
+  try {
+    await authApi.changePassword({
+      old_password: oldPassword.value,
+      new_password: newPassword.value,
+    })
+    oldPassword.value = ''
+    newPassword.value = ''
+    confirmPassword.value = ''
+    passwordSaved.value = '密码已修改，请用新密码重新登录'
+    // 服务端已吊销全部 refresh，本地登录态一并作废；不自动关弹窗，让用户看到提示
+    await logout()
+  } catch (e) {
+    passwordError.value = e instanceof Error ? e.message : '修改失败'
+  } finally {
+    passwordSaving.value = false
+  }
+}
+
 watch(nav, () => {
   logoutConfirm.value = false
+  profileEditing.value = false
+  profileError.value = ''
+  profileSaved.value = ''
+  passwordError.value = ''
+  passwordSaved.value = ''
 })
 
 /** 用当前表单草稿值探测连通性 / 密钥有效性（无需先保存） */
@@ -563,7 +1284,7 @@ async function onTest() {
               class="w-full h-9 flex items-center gap-2.5 rounded-lg px-3 text-[13px] transition"
               :class="nav === item.key ? 'bg-stone-100 text-stone-900 font-medium' : 'text-stone-600 hover:bg-stone-100'"
             >
-              <!-- 账号与余额 -->
+              <!-- 账户 -->
               <svg v-if="item.key === 'account'" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                 <circle cx="12" cy="8" r="4" />
                 <path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5" />
@@ -870,34 +1591,154 @@ async function onTest() {
               </div>
             </template>
 
-            <!-- 账号与余额 -->
+            <!-- 账户 -->
             <template v-else-if="nav === 'account'">
-              <h3 class="text-[17px] font-semibold text-stone-800">账号与余额</h3>
+              <h3 class="text-[17px] font-semibold text-stone-800">账户</h3>
               <p class="mt-1 text-[12.5px] text-stone-400">
-                查看当前登录账号，余额与用量统计即将开放。
+                管理个人资料与登录密码，余额与用量统计即将开放。
               </p>
 
-              <div v-if="isLoggedIn" class="mt-4 flex items-center gap-3 px-4 py-3.5 rounded-xl border border-stone-200">
-                <span class="h-10 w-10 shrink-0 rounded-full bg-gradient-to-br from-stone-300 to-stone-500 grid place-items-center text-[14px] font-semibold text-white">
-                  {{ (user?.username || '?').charAt(0).toUpperCase() }}
-                </span>
-                <span class="min-w-0 flex-1 leading-tight">
-                  <span class="block text-[13.5px] font-semibold text-stone-800 truncate">{{ user?.username }}</span>
-                  <span class="block text-[11.5px] text-stone-500 truncate">{{ user?.email }}</span>
-                </span>
-                <button
-                  type="button"
-                  @click="onLogout"
-                  class="h-8 px-4 shrink-0 rounded-lg border text-[13px] transition"
-                  :class="
-                    logoutConfirm
-                      ? 'border-red-200 bg-red-50 text-red-600 hover:bg-red-100'
-                      : 'border-stone-200 text-stone-600 hover:border-red-200 hover:text-red-600'
-                  "
-                >
-                  {{ logoutConfirm ? '确认退出' : '退出登录' }}
-                </button>
-              </div>
+              <template v-if="isLoggedIn">
+                <!-- 个人资料 -->
+                <div class="mt-4 rounded-xl border border-stone-200">
+                  <div class="flex items-center gap-3 px-4 py-3.5">
+                    <img
+                      v-if="user?.avatar"
+                      :src="user.avatar"
+                      alt="头像"
+                      class="h-11 w-11 shrink-0 rounded-full object-cover"
+                    />
+                    <span
+                      v-else
+                      class="h-11 w-11 shrink-0 rounded-full bg-gradient-to-br from-stone-300 to-stone-500 grid place-items-center text-[14px] font-semibold text-white"
+                    >
+                      {{ (user?.nickname || user?.username || '?').charAt(0).toUpperCase() }}
+                    </span>
+                    <span class="min-w-0 flex-1 leading-tight">
+                      <span class="block text-[13.5px] font-semibold text-stone-800 truncate">{{ user?.nickname || user?.username }}</span>
+                      <span class="block text-[11.5px] text-stone-500 truncate">{{ user?.username }} · {{ user?.email }}</span>
+                    </span>
+                    <button
+                      v-if="!profileEditing"
+                      type="button"
+                      @click="startEditProfile"
+                      class="h-8 px-3 shrink-0 rounded-lg border border-stone-200 text-[12.5px] text-stone-600 hover:bg-stone-50 transition"
+                    >
+                      编辑资料
+                    </button>
+                  </div>
+
+                  <div v-if="profileEditing" class="border-t border-stone-100 px-4 py-3.5 space-y-3">
+                    <p v-if="profileError" class="rounded-lg bg-red-50 px-3 py-2 text-[12px] text-red-600">{{ profileError }}</p>
+                    <div>
+                      <p class="mb-1.5 text-[12px] text-stone-500">头像</p>
+                      <div class="flex items-center gap-3">
+                        <button
+                          type="button"
+                          @click="pickAvatar"
+                          class="h-14 w-14 shrink-0 overflow-hidden rounded-full border border-stone-200 hover:border-stone-400 transition"
+                          title="点击更换头像"
+                        >
+                          <img v-if="avatarDraft" :src="avatarDraft" alt="头像预览" class="h-full w-full object-cover" />
+                          <span v-else class="h-full w-full grid place-items-center bg-stone-100 text-[11px] text-stone-400">上传</span>
+                        </button>
+                        <span class="text-[11.5px] text-stone-400">点击左侧更换，图片会自动压缩</span>
+                      </div>
+                      <input
+                        ref="avatarInput"
+                        type="file"
+                        accept="image/png,image/jpeg,image/gif,image/webp"
+                        class="hidden"
+                        @change="onAvatarPicked"
+                      />
+                    </div>
+                    <div>
+                      <label for="nickname-draft" class="mb-1.5 block text-[12px] text-stone-500">昵称</label>
+                      <input
+                        id="nickname-draft"
+                        v-model="nicknameDraft"
+                        type="text"
+                        maxlength="64"
+                        placeholder="请输入昵称"
+                        class="h-9 w-full rounded-lg border border-stone-200 px-3 text-[13px] text-stone-800 outline-none focus:border-stone-400"
+                      />
+                    </div>
+                    <div class="flex justify-end gap-2">
+                      <button
+                        type="button"
+                        @click="cancelEditProfile"
+                        class="h-8 px-3 rounded-lg border border-stone-200 text-[12.5px] text-stone-600 hover:bg-stone-50 transition"
+                      >
+                        取消
+                      </button>
+                      <button
+                        type="button"
+                        @click="saveProfile"
+                        :disabled="profileSaving"
+                        class="h-8 px-4 rounded-lg bg-stone-800 text-[12.5px] text-white hover:bg-stone-700 disabled:opacity-50 transition"
+                      >
+                        {{ profileSaving ? '保存中…' : '保存' }}
+                      </button>
+                    </div>
+                  </div>
+                  <p v-if="profileSaved && !profileEditing" class="border-t border-stone-100 px-4 py-2 text-[11.5px] text-green-600">{{ profileSaved }}</p>
+                </div>
+
+                <!-- 修改密码 -->
+                <div class="mt-4 rounded-xl border border-stone-200 px-4 py-3.5">
+                  <h4 class="text-[13px] font-medium text-stone-800">修改密码</h4>
+                  <div class="mt-3 space-y-2">
+                    <input
+                      v-model="oldPassword"
+                      type="password"
+                      autocomplete="current-password"
+                      placeholder="当前密码"
+                      class="h-9 w-full rounded-lg border border-stone-200 px-3 text-[13px] text-stone-800 outline-none focus:border-stone-400"
+                    />
+                    <input
+                      v-model="newPassword"
+                      type="password"
+                      autocomplete="new-password"
+                      placeholder="新密码（至少 6 位）"
+                      class="h-9 w-full rounded-lg border border-stone-200 px-3 text-[13px] text-stone-800 outline-none focus:border-stone-400"
+                    />
+                    <input
+                      v-model="confirmPassword"
+                      type="password"
+                      autocomplete="new-password"
+                      placeholder="确认新密码"
+                      class="h-9 w-full rounded-lg border border-stone-200 px-3 text-[13px] text-stone-800 outline-none focus:border-stone-400"
+                    />
+                  </div>
+                  <p v-if="passwordError" class="mt-2 text-[11.5px] text-red-600">{{ passwordError }}</p>
+                  <p v-if="passwordSaved" class="mt-2 text-[11.5px] text-green-600">{{ passwordSaved }}</p>
+                  <div class="mt-3 flex justify-end">
+                    <button
+                      type="button"
+                      @click="changePassword"
+                      :disabled="passwordSaving"
+                      class="h-8 px-4 rounded-lg border border-stone-200 text-[12.5px] text-stone-700 hover:bg-stone-50 disabled:opacity-50 transition"
+                    >
+                      {{ passwordSaving ? '提交中…' : '修改密码' }}
+                    </button>
+                  </div>
+                </div>
+
+                <div class="mt-4 flex justify-end">
+                  <button
+                    type="button"
+                    @click="onLogout"
+                    class="h-8 px-4 rounded-lg border text-[13px] transition"
+                    :class="
+                      logoutConfirm
+                        ? 'border-red-200 bg-red-50 text-red-600 hover:bg-red-100'
+                        : 'border-stone-200 text-stone-600 hover:border-red-200 hover:text-red-600'
+                    "
+                  >
+                    {{ logoutConfirm ? '确认退出' : '退出登录' }}
+                  </button>
+                </div>
+              </template>
               <p v-else class="mt-4 text-[12.5px] text-stone-400">当前未登录，依赖账户的功能不可用。</p>
             </template>
 
@@ -937,7 +1778,7 @@ async function onTest() {
                       <span v-if="!a.is_active" class="ml-1 text-[10.5px] text-stone-400">已停用</span>
                     </span>
                     <span class="block text-[11.5px] text-stone-400 truncate">
-                      {{ a.agent_key }} · {{ a.platform || '默认平台' }} / {{ a.model || '默认模型' }} · 提示词 v{{ a.active_prompt_version }}
+                      {{ a.agent_key }} · 提示词 v{{ a.active_prompt_version }}
                     </span>
                   </span>
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="shrink-0 text-stone-400" stroke-linecap="round">
@@ -968,28 +1809,6 @@ async function onTest() {
                 <label class="block text-[12px] text-stone-600">
                   描述
                   <input v-model="agDescription" maxlength="255" class="mt-1 h-9 w-full rounded-lg border border-stone-200 px-2.5 text-[12.5px]" />
-                </label>
-
-                <div class="grid grid-cols-2 gap-3">
-                  <label class="text-[12px] text-stone-600">
-                    平台（留空沿用请求）
-                    <select v-model="agPlatform" class="mt-1 h-9 w-full rounded-lg border border-stone-200 px-2 text-[12.5px]">
-                      <option value="">默认</option>
-                      <option v-for="p in agentPlatforms" :key="p" :value="p">{{ p }}</option>
-                    </select>
-                  </label>
-                  <label class="text-[12px] text-stone-600">
-                    模型（留空沿用请求）
-                    <input v-model="agModel" list="agent-model-options" maxlength="128" class="mt-1 h-9 w-full rounded-lg border border-stone-200 px-2.5 text-[12.5px]" />
-                    <datalist id="agent-model-options">
-                      <option v-for="m in agentModels" :key="m.platform + '/' + m.model" :value="m.model" />
-                    </datalist>
-                  </label>
-                </div>
-
-                <label class="flex items-center gap-2 text-[12.5px] text-stone-600">
-                  <input v-model="agThinking" type="checkbox" class="h-4 w-4 accent-stone-800" />
-                  默认开启深度思考（请求里显式选择时仍以请求为准）
                 </label>
 
                 <div class="rounded-xl border border-stone-200 p-3">
@@ -1033,6 +1852,276 @@ async function onTest() {
                     placeholder="版本备注（可选）"
                     class="mt-2 h-8 w-full rounded-lg border border-stone-200 px-2.5 text-[12px]"
                   />
+
+                  <div class="mt-2 flex items-center gap-2">
+                    <button
+                      type="button"
+                      @click="generateSystemPrompt"
+                      :disabled="systemPromptGenerating"
+                      class="h-8 px-3 shrink-0 rounded-lg border border-stone-200 bg-white text-[11.5px] text-stone-600 hover:bg-stone-50 disabled:opacity-40 transition"
+                    >
+                      {{ systemPromptGenerating ? '生成中…' : '生成系统提示词' }}
+                    </button>
+                    <button
+                      v-if="agPrompt.trim()"
+                      type="button"
+                      @click="saveSystemPromptPreview"
+                      :disabled="agentEditingId === null || systemPromptSaving"
+                      class="h-8 px-3 shrink-0 rounded-lg bg-stone-800 text-[11.5px] text-white hover:bg-stone-700 disabled:opacity-40 transition"
+                    >
+                      {{ systemPromptSaving ? '保存中…' : '保存到提示词版本' }}
+                    </button>
+                    <span v-if="systemPromptError" class="text-[11px] text-red-600">{{ systemPromptError }}</span>
+                  </div>
+                  <p class="mt-1 text-[10.5px] text-stone-400">
+                    生成时会按 Agent 预设里保存的上下文顺序追加分段标签；提示词留空时用默认基础提示词。保存会发布为新版本并自动启用。
+                  </p>
+                </div>
+
+                <div class="rounded-xl border border-stone-200 p-3">
+                  <div>
+                    <p class="text-[12.5px] font-medium text-stone-700">上下文分段</p>
+                    <p class="mt-0.5 text-[11.5px] text-stone-400">
+                      按优先级注入到系统提示词之后；Agent、用户与长期记忆分开管理，每组独立保存。
+                    </p>
+                    <p v-if="agentEditingId === null" class="mt-2 text-[11px] text-stone-400">
+                      新建 Agent 需先用底部「保存」创建后，才能单独保存上下文。
+                    </p>
+                    <p v-if="contextGenerateError" class="mt-2 rounded-lg bg-red-50 px-3 py-2 text-[11.5px] text-red-600">
+                      {{ contextGenerateError }}
+                    </p>
+                  </div>
+
+                  <div
+                    v-for="group in contextGroups"
+                    :key="group.key"
+                    class="mt-3 rounded-lg border border-stone-200 bg-stone-50/40 p-3"
+                  >
+                    <div class="flex items-start justify-between gap-3">
+                      <div>
+                        <p class="text-[12px] font-medium text-stone-700">{{ group.label }}</p>
+                        <p class="mt-0.5 text-[11px] text-stone-400">{{ group.description }}</p>
+                        <p v-if="contextSaved[group.key]" class="mt-1 text-[10.5px] text-green-600">
+                          {{ contextSaved[group.key] }}
+                        </p>
+                      </div>
+                      <div class="flex shrink-0 items-center gap-1.5">
+                        <button
+                          v-if="group.key !== 'memory'"
+                          type="button"
+                          @click="saveContextGroup(group.key)"
+                          :disabled="contextSaving[group.key] || agentEditingId === null || !group.drafts.length"
+                          class="h-7 px-2.5 rounded-lg bg-stone-800 text-[11.5px] text-white hover:bg-stone-700 disabled:opacity-40 transition"
+                        >
+                          {{ contextSaving[group.key] ? '保存中…' : '保存' }}
+                        </button>
+                        <button
+                          v-if="group.key !== 'memory'"
+                          type="button"
+                          @click="contextPickerGroup = group.key"
+                          class="h-7 px-2.5 rounded-lg border border-stone-200 bg-white text-[11.5px] text-stone-600 hover:bg-stone-50 transition"
+                        >
+                          + 添加
+                        </button>
+                        <button
+                          v-else
+                          type="button"
+                          @click="addMemoryDraft"
+                          :disabled="agentEditingId === null"
+                          class="h-7 px-2.5 rounded-lg border border-stone-200 bg-white text-[11.5px] text-stone-600 hover:bg-stone-50 disabled:opacity-40 transition"
+                        >
+                          + 新增记忆
+                        </button>
+                      </div>
+                    </div>
+
+                    <div v-if="group.key === 'memory'">
+                      <p v-if="!memoryDrafts.length" class="mt-2 py-3 text-center text-[11.5px] text-stone-400">
+                        暂无记忆，点「+ 新增记忆」添加一条。
+                      </p>
+                      <div
+                        v-for="(memory, index) in memoryDrafts"
+                        :key="memory.id"
+                        class="mt-2 rounded-lg border border-stone-200 bg-white p-3"
+                      >
+                        <div class="flex items-center justify-between gap-2">
+                          <span class="text-[12px] font-medium text-stone-700">记忆 {{ index + 1 }}</span>
+                          <div class="flex items-center gap-2">
+                            <label class="flex items-center gap-1 text-[11px] text-stone-500">
+                              <input
+                                :checked="memory.enabled"
+                                @change="toggleMemoryEnabled(memory, ($event.target as HTMLInputElement).checked)"
+                                type="checkbox"
+                                class="h-3.5 w-3.5 accent-stone-800"
+                              />
+                              启用
+                            </label>
+                            <button
+                              type="button"
+                              @click="removeMemoryDraft(memory)"
+                              class="text-[11px] text-stone-400 hover:text-red-600"
+                            >
+                              删除
+                            </button>
+                          </div>
+                        </div>
+                        <textarea
+                          :value="memory.content"
+                          @change="updateMemoryContent(memory, ($event.target as HTMLTextAreaElement).value)"
+                          rows="3"
+                          maxlength="20000"
+                          placeholder="例如：用户偏好中文回答，先看结论再看依据。"
+                          class="mt-2 w-full resize-y rounded-lg border border-stone-200 px-2.5 py-2 text-[12px] leading-[1.6]"
+                        />
+                        <p class="mt-1 text-[10.5px] text-stone-400">失焦后自动保存</p>
+                      </div>
+                    </div>
+
+                    <template v-else>
+                    <p v-if="!group.drafts.length" class="mt-2 py-3 text-center text-[11.5px] text-stone-400">
+                      暂无分段
+                    </p>
+
+                    <div
+                      v-for="draft in group.drafts"
+                      :key="draft.localId"
+                      class="mt-2 rounded-lg border border-stone-200 bg-white p-3"
+                    >
+                      <div class="flex items-start justify-between gap-2">
+                        <div class="min-w-0">
+                          <p class="text-[12px] font-medium text-stone-700">
+                            {{ draft.title || draft.key }}
+                            <span class="ml-1.5 rounded bg-stone-100 px-1.5 py-0.5 text-[10px] font-normal text-stone-500">{{ draft.trustHint }}</span>
+                          </p>
+                          <p class="mt-0.5 text-[10.5px] leading-[1.5] text-stone-400">{{ presetDescription(draft) }}</p>
+                        </div>
+                        <div class="flex shrink-0 items-center gap-2">
+                          <label class="flex items-center gap-1 text-[11px] text-stone-500">
+                            <input v-model="draft.enabled" type="checkbox" class="h-3.5 w-3.5 accent-stone-800" />
+                            启用
+                          </label>
+                          <button
+                            v-if="draft.bindingId === null"
+                            type="button"
+                            @click="removeContextDraft(draft.localId)"
+                            class="text-[11px] text-stone-400 hover:text-red-600"
+                          >
+                            移除
+                          </button>
+                        </div>
+                      </div>
+
+                      <div v-if="draft.resolver === 'agent_doc'" class="mt-2">
+                        <div class="flex items-center justify-between gap-2">
+                          <span class="text-[11px] text-stone-500">
+                            内容{{ draft.globalDoc ? '（全局共享，修改会影响所有 Agent）' : '' }}
+                          </span>
+                          <button
+                            v-if="draft.key in GENERATE_LABELS"
+                            type="button"
+                            :disabled="generatingContext === draft.localId"
+                            @click="generateDraftContent(draft)"
+                            class="h-7 px-2.5 shrink-0 rounded-lg border border-stone-200 bg-white text-[11px] text-stone-600 hover:bg-stone-50 disabled:opacity-50 transition"
+                          >
+                            {{ generatingContext === draft.localId ? '生成中…' : generateButtonLabel(draft.key) }}
+                          </button>
+                        </div>
+                        <textarea
+                          v-model="draft.content"
+                          rows="4"
+                          maxlength="20000"
+                          :placeholder="presetDescription(draft)"
+                          class="mt-1 w-full resize-y rounded-lg border border-stone-200 px-2.5 py-2 text-[12px] leading-[1.6]"
+                        />
+                        <p v-if="contextGenerateError && generatingContext === null" class="mt-1 text-[11px] text-red-600">
+                          {{ contextGenerateError }}
+                        </p>
+                      </div>
+                    </div>
+                    </template>
+                  </div>
+                </div>
+
+                <div class="rounded-xl border border-stone-200 p-3">
+                  <div class="flex items-start justify-between gap-3">
+                    <div>
+                      <p class="text-[12.5px] font-medium text-stone-700">上下文拼接顺序</p>
+                      <p class="mt-0.5 text-[11.5px] text-stone-400">
+                        拖动条目调整拼接顺序，越靠前越先注入；也可用右侧上下按钮微调。
+                      </p>
+                      <p class="mt-0.5 text-[11.5px] text-stone-400">
+                        只有 Identity、Soul、Agents Guide 有权发出指令，其余只是数据。
+                      </p>
+                      <p v-if="orderSaved" class="mt-1 text-[10.5px] text-green-600">{{ orderSaved }}</p>
+                      <p v-if="orderError" class="mt-1 text-[10.5px] text-red-600">{{ orderError }}</p>
+                    </div>
+                    <span class="shrink-0 text-[10.5px] text-stone-400">{{ contextDrafts.length }} 个分段</span>
+                  </div>
+
+                  <p v-if="agentEditingId === null" class="mt-3 text-[11px] text-stone-400">
+                    新建 Agent 需先用底部「保存」创建后，才能调整拼接顺序。
+                  </p>
+                  <p v-else-if="!contextDrafts.length" class="mt-3 py-3 text-center text-[11.5px] text-stone-400">
+                    暂无可排序的上下文分段。
+                  </p>
+                  <div v-else class="mt-3 space-y-1.5">
+                    <div
+                      v-for="(draft, index) in contextDrafts"
+                      :key="draft.localId"
+                      draggable="true"
+                      @dragstart="onOrderDragStart($event, index)"
+                      @dragover="onOrderDragOver($event, index)"
+                      @drop="onOrderDrop($event, index)"
+                      @dragend="onOrderDragEnd"
+                      :class="[
+                        orderDraggingId === draft.localId ? 'opacity-40' : '',
+                        orderDropIndex === index && orderDraggingId !== null
+                          ? 'border-stone-800 bg-stone-100'
+                          : 'border-stone-200 bg-white',
+                      ]"
+                      class="flex items-center gap-2 rounded-lg border px-2.5 py-2 text-[12px]"
+                    >
+                      <span class="shrink-0 cursor-grab text-stone-400" title="拖动排序">
+                        <svg width="12" height="16" viewBox="0 0 12 16" fill="currentColor">
+                          <circle cx="3" cy="3" r="1" /><circle cx="9" cy="3" r="1" />
+                          <circle cx="3" cy="8" r="1" /><circle cx="9" cy="8" r="1" />
+                          <circle cx="3" cy="13" r="1" /><circle cx="9" cy="13" r="1" />
+                        </svg>
+                      </span>
+                      <span class="w-5 shrink-0 text-[11px] text-stone-400">{{ index + 1 }}</span>
+                      <span class="min-w-0 flex-1 truncate text-stone-700">{{ draft.title || draft.key }}</span>
+                      <span class="shrink-0 text-[10.5px] text-stone-400">
+                        {{ draft.key }} · {{ draft.trustHint }} · 优先级 {{ draft.priority }}{{ draft.enabled ? '' : ' · 未启用' }}
+                      </span>
+                      <button
+                        type="button"
+                        @click="moveContextDraft(index, index - 1)"
+                        :disabled="index === 0"
+                        class="h-6 w-6 shrink-0 rounded border border-stone-200 text-[11px] text-stone-500 hover:bg-stone-50 disabled:opacity-30"
+                        title="上移"
+                      >↑</button>
+                      <button
+                        type="button"
+                        @click="moveContextDraft(index, index + 1)"
+                        :disabled="index === contextDrafts.length - 1"
+                        class="h-6 w-6 shrink-0 rounded border border-stone-200 text-[11px] text-stone-500 hover:bg-stone-50 disabled:opacity-30"
+                        title="下移"
+                      >↓</button>
+                    </div>
+                  </div>
+
+                  <div class="mt-3 flex items-center justify-between gap-3">
+                    <p v-if="orderDirty" class="text-[10.5px] text-amber-600">顺序已调整，记得保存。</p>
+                    <span v-else />
+                    <button
+                      type="button"
+                      @click="saveContextOrder"
+                      :disabled="agentEditingId === null || orderSaving || !contextDrafts.length"
+                      class="h-8 px-4 shrink-0 rounded-lg bg-stone-800 text-[12px] text-white hover:bg-stone-700 disabled:opacity-40 transition"
+                    >
+                      {{ orderSaving ? '保存中…' : '保存顺序' }}
+                    </button>
+                  </div>
                 </div>
 
                 <div v-if="adminPrompts.length" class="rounded-xl border border-stone-200 p-3">
@@ -1102,6 +2191,47 @@ async function onTest() {
               <p class="mt-1 text-[12.5px] text-stone-400">该模块尚在建设中，敬请期待。</p>
             </template>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <div
+      v-if="contextPickerGroup"
+      class="fixed inset-0 z-[60] flex items-center justify-center bg-black/30 backdrop-blur-sm"
+      @mousedown.self="contextPickerGroup = null"
+    >
+      <div class="w-[min(92vw,460px)] rounded-2xl bg-white p-5 shadow-xl shadow-stone-900/10">
+        <div class="flex items-center justify-between gap-3">
+          <div>
+            <h4 class="text-[15px] font-semibold text-stone-800">添加 {{ contextPickerLabel }}</h4>
+            <p class="mt-0.5 text-[11.5px] leading-[1.5] text-stone-400">
+              选好后会自动填好优先级、Token 预算和信任级别；你只需要填写内容（如果有）。
+            </p>
+          </div>
+          <button
+            type="button"
+            @click="contextPickerGroup = null"
+            class="h-7 w-7 rounded-lg text-stone-400 hover:bg-stone-100 hover:text-stone-700"
+          >
+            ×
+          </button>
+        </div>
+
+        <div class="mt-4 space-y-2">
+          <button
+            v-for="preset in activePresets"
+            :key="preset.key"
+            type="button"
+            :disabled="contextDrafts.some((d) => d.key === preset.key)"
+            @click="addPresetContext(preset)"
+            class="w-full rounded-xl border border-stone-200 px-3 py-2.5 text-left transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-[13px] font-medium text-stone-800">{{ preset.title }}</span>
+              <span v-if="contextDrafts.some((d) => d.key === preset.key)" class="text-[10.5px] text-stone-400">已添加</span>
+            </div>
+            <p class="mt-1 text-[11.5px] leading-[1.5] text-stone-500">{{ preset.description }}</p>
+          </button>
         </div>
       </div>
     </div>

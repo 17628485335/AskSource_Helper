@@ -216,6 +216,213 @@ export function activateAgentPrompt(id: number, version: number): Promise<AgentD
   })
 }
 
+/* ---------------- Agent 上下文分段 ---------------- */
+
+export type ContextResolver = 'agent_doc' | 'user_doc' | 'generated' | 'memory' | 'none'
+export type ContextTrustLevel = 'anchor' | 'policy' | 'data' | 'generated'
+
+export interface AgentContextBindingDto {
+  id: number
+  agent_id: number
+  key: string
+  title: string
+  resolver: ContextResolver
+  ref_key: string
+  enabled: boolean
+  priority: number
+  max_tokens: number
+  trust_level: ContextTrustLevel
+  trust_hint: string
+  created_at: string
+  updated_at: string
+}
+
+export interface AgentContextDocDto {
+  id: number
+  agent_id: number | null
+  key: string
+  title: string
+  content: string
+  version_hash: string
+  created_at: string
+  updated_at: string
+}
+
+export interface AgentContextBindingPayload {
+  key: string
+  title?: string
+  resolver?: ContextResolver
+  ref_key?: string
+  enabled?: boolean
+  priority?: number
+  max_tokens?: number
+  trust_level?: ContextTrustLevel
+  trust_hint?: string
+}
+
+export type AgentContextBindingUpdatePayload = Partial<Omit<AgentContextBindingPayload, 'key'>>
+
+export interface AgentContextDocPayload {
+  agent_id?: number | null
+  key: string
+  title?: string
+  content?: string
+}
+
+export interface AgentContextDocUpdatePayload {
+  title?: string
+  content?: string
+}
+
+export function listAgentBindings(agentId: number): Promise<AgentContextBindingDto[]> {
+  return request<AgentContextBindingDto[]>(`/context/agent-bindings?agent_id=${agentId}`, {
+    withAuth: true,
+  })
+}
+
+export function createAgentBinding(
+  agentId: number,
+  payload: AgentContextBindingPayload,
+): Promise<AgentContextBindingDto> {
+  return request<AgentContextBindingDto>(`/context/agent-bindings?agent_id=${agentId}`, {
+    method: 'POST',
+    withAuth: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: jsonBody(payload),
+  })
+}
+
+export function updateAgentBinding(
+  bindingId: number,
+  payload: AgentContextBindingUpdatePayload,
+): Promise<AgentContextBindingDto> {
+  return request<AgentContextBindingDto>(`/context/agent-bindings/${bindingId}`, {
+    method: 'PATCH',
+    withAuth: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: jsonBody(payload),
+  })
+}
+
+export function listAgentDocs(
+  agentId?: number | null,
+  includeGlobal = true,
+): Promise<AgentContextDocDto[]> {
+  const query = new URLSearchParams()
+  if (agentId != null) query.set('agent_id', String(agentId))
+  query.set('include_global', String(includeGlobal))
+  return request<AgentContextDocDto[]>(`/context/agent-docs?${query.toString()}`, {
+    withAuth: true,
+  })
+}
+
+export function createAgentDoc(payload: AgentContextDocPayload): Promise<AgentContextDocDto> {
+  return request<AgentContextDocDto>('/context/agent-docs', {
+    method: 'POST',
+    withAuth: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: jsonBody(payload),
+  })
+}
+
+export function updateAgentDoc(
+  docId: number,
+  payload: AgentContextDocUpdatePayload,
+): Promise<AgentContextDocDto> {
+  return request<AgentContextDocDto>(`/context/agent-docs/${docId}`, {
+    method: 'PATCH',
+    withAuth: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: jsonBody(payload),
+  })
+}
+
+export type ContextGenerateKind = 'soul' | 'identity' | 'agents_guide' | 'user_profile'
+
+export interface ContextGeneratePayload {
+  kind: ContextGenerateKind
+  agent_id?: number | null
+  current?: string
+  hint?: string
+  variant?: number
+}
+
+export interface ContextGenerateResult {
+  content: string
+}
+
+/** 调用 LLM 生成上下文段正文；只支持 soul / identity / agents_guide */
+export function generateContextContent(
+  payload: ContextGeneratePayload,
+): Promise<ContextGenerateResult> {
+  return request<ContextGenerateResult>('/context/generate', {
+    method: 'POST',
+    withAuth: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: jsonBody(payload),
+  })
+}
+
+/** 与运行时共用同一套拼装逻辑，生成最终注入模型的系统提示词 */
+export function composeSystemPrompt(payload: {
+  prompt: string
+  agent_id?: number | null
+  tool_names?: string[] | null
+}): Promise<ContextGenerateResult> {
+  return request<ContextGenerateResult>('/context/compose-system-prompt', {
+    method: 'POST',
+    withAuth: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: jsonBody(payload),
+  })
+}
+
+/* ---------------- Agent 长期记忆 ---------------- */
+
+export interface AgentMemoryDto {
+  id: number
+  agent_id: number
+  content: string
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+export function listAgentMemories(agentId: number): Promise<AgentMemoryDto[]> {
+  return request<AgentMemoryDto[]>(`/context/agent-memories?agent_id=${agentId}`, {
+    withAuth: true,
+  })
+}
+
+export function createAgentMemory(agentId: number, content: string): Promise<AgentMemoryDto> {
+  return request<AgentMemoryDto>(`/context/agent-memories?agent_id=${agentId}`, {
+    method: 'POST',
+    withAuth: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: jsonBody({ content }),
+  })
+}
+
+export function updateAgentMemory(
+  agentId: number,
+  memoryId: number,
+  payload: { content?: string; enabled?: boolean },
+): Promise<AgentMemoryDto> {
+  return request<AgentMemoryDto>(`/context/agent-memories/${memoryId}?agent_id=${agentId}`, {
+    method: 'PATCH',
+    withAuth: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: jsonBody(payload),
+  })
+}
+
+export function deleteAgentMemory(agentId: number, memoryId: number): Promise<void> {
+  return request<void>(`/context/agent-memories/${memoryId}?agent_id=${agentId}`, {
+    method: 'DELETE',
+    withAuth: true,
+  })
+}
+
 /** 连通性测试结果（与后端 ProviderTestResult 对齐） */
 export interface LlmTestResult {
   ok: boolean

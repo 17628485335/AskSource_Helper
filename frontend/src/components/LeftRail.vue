@@ -652,14 +652,22 @@ watch(isLoggedIn, (v) => {
         class="mt-3 flex items-center"
         :class="collapsed ? 'flex-col gap-1.5' : 'gap-2 px-1'"
       >
+        <img
+          v-if="user?.avatar"
+          :src="user.avatar"
+          alt="头像"
+          class="h-9 w-9 shrink-0 rounded-full object-cover"
+          :title="user?.nickname || user?.username"
+        />
         <div
+          v-else
           class="h-9 w-9 shrink-0 rounded-full bg-gradient-to-br from-[#D9C9A3] to-[#7C9A5C] grid place-items-center text-[12px] font-semibold text-white"
-          :title="user?.username"
+          :title="user?.nickname || user?.username"
         >
-          {{ (user?.username || '?').charAt(0).toUpperCase() }}
+          {{ (user?.nickname || user?.username || '?').charAt(0).toUpperCase() }}
         </div>
         <span v-if="!collapsed" class="min-w-0 flex-1 leading-tight">
-          <span class="block text-[12.5px] font-medium text-[#2b2a22] truncate">{{ user?.username }}</span>
+          <span class="block text-[12.5px] font-medium text-[#2b2a22] truncate">{{ user?.nickname || user?.username }}</span>
           <span class="block text-[10.5px] text-[#6d6a52] truncate">{{ user?.email }}</span>
         </span>
         <!-- 模型配置（密钥）只有管理员能改，普通用户看不到这个入口 -->

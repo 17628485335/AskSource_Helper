@@ -32,6 +32,11 @@ export default defineConfig({
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
+      // 上下文分段管理与内容生成接口（/context）
+      '/context': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
       '/chat': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,

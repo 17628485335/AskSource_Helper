@@ -14,6 +14,7 @@ from auth.database import AsyncSessionLocal
 from .agents.router import router as agents_router
 from .chat import ChatManager
 from .chat.router import router as chat_router
+from .context.router import router as context_router
 from .session.router import router as session_router
 from .settings.router import router as settings_router
 from .workspace.router import router as workspace_router
@@ -48,6 +49,9 @@ app.include_router(settings_router)
 
 # 挂载 agent 路由（/agents、/agents/{id}/prompts）
 app.include_router(agents_router)
+
+# 挂载上下文段路由（/context/agent-bindings、/context/user-docs）
+app.include_router(context_router)
 
 # 挂载会话路由（/sessions、/sessions/{id}/messages）
 app.include_router(session_router)

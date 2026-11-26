@@ -15,11 +15,16 @@ from pydantic import BaseModel, ConfigDict
 
 __all__ = [
     "CITATION_KEY",
+    "MAX_SEARCH_RESULTS",
     "Citation",
     "build_artifact",
     "citation_offset",
+    "citation_start",
     "extract_citations",
 ]
+
+# web_search 实际夹取的上限；并行调用预分配编号时要按同一口径算
+MAX_SEARCH_RESULTS = 5
 
 # artifact 里放引用列表的键名
 CITATION_KEY = "citations"
@@ -69,6 +74,54 @@ def citation_offset(state: Any) -> int:
             except (TypeError, ValueError):
                 continue
     return highest
+
+
+def _call_field(call: Any, key: str, default: Any = None) -> Any:
+    """tool_call 在 AIMessage 里可能是 dict 也可能是 ToolCall 对象"""
+    if isinstance(call, dict):
+        return call.get(key, default)
+    return getattr(call, key, default)
+
+
+def _expected_count(name: str, args: dict[str, Any]) -> int:
+    """同一批 tool_call 里，这个调用预计产生几条引用（用于并行预分配编号）"""
+    if name == "web_search":
+        try:
+            return max(1, min(int(args.get("max_results", 3)), MAX_SEARCH_RESULTS))
+        except (TypeError, ValueError):
+            return 3
+    if name == "read_url":
+        urls = args.get("urls")
+        return len(urls) if isinstance(urls, (list, tuple)) else 1
+    return 0
+
+
+def citation_start(state: Any, tool_call_id: str = "") -> int:
+    """本工具本次调用的起始引用编号。
+
+    并行 tool_call 共享同一份 state，彼此看不到对方刚产生的 ToolMessage；
+    光靠 citation_offset(state) 会让同批的两个 web_search 都从 [1] 开始。
+    这里从当前 AIMessage.tool_calls 里找到自己的位置，按前面每个调用的预计条数
+    预留号段，保证同批并发也拿到连续且不重叠的编号。
+    """
+    base = citation_offset(state)
+    if not tool_call_id:
+        return base + 1
+
+    messages = state.get("messages") if isinstance(state, dict) else None
+    for message in reversed(messages or []):
+        calls = getattr(message, "tool_calls", None) or []
+        if not any(_call_field(c, "id", "") == tool_call_id for c in calls):
+            continue
+        for call in calls:
+            if _call_field(call, "id", "") == tool_call_id:
+                break
+            base += _expected_count(
+                _call_field(call, "name", "") or "",
+                _call_field(call, "args", None) or {},
+            )
+        break
+    return base + 1
 
 
 def build_artifact(citations: list[Citation], *, query: str = "", tool: str = "") -> dict[str, Any]:

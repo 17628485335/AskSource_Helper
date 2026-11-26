@@ -326,7 +326,16 @@ function submit() {
   void scrollToBottom(true)
 }
 
+/** 输入法合成期间（中文选字等）：Enter 是确认候选词，不能当发送键 */
+const composing = ref(false)
+
+function onCompositionEnd() {
+  composing.value = false
+}
+
 function onKeydown(e: KeyboardEvent) {
+  // isComposing 是标准标志；keyCode 229 兼容部分输入法/内核在合成期不发 isComposing 的情况
+  if (composing.value || e.isComposing || e.keyCode === 229) return
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
     submit()
@@ -662,42 +671,9 @@ onBeforeUnmount(() => {
             </div>
 
             <!-- 助手消息 -->
-            <div v-else class="group max-w-[92%] min-w-0">
-              <div v-if="m.toolCalls.length" class="mb-2.5 flex flex-wrap gap-2">
-                <span
-                  v-for="tc in m.toolCalls"
-                  :key="tc.callId || tc.name"
-                  class="inline-flex items-center gap-1.5 rounded-full border border-stone-200 bg-stone-50 px-2.5 py-1 text-[11.5px] text-stone-600"
-                  :title="tc.state === 'running' ? '执行中…' : undefined"
-                >
-                  <!-- 协议 v2 的 tool_start/tool_end（按 call_id 跟踪）：running 转圈，done 打勾 -->
-                  <span
-                    v-if="tc.state === 'running'"
-                    class="h-3 w-3 shrink-0 animate-spin rounded-full border-[1.5px] border-stone-300 border-t-stone-600"
-                  ></span>
-                  <svg
-                    v-else-if="tc.state === 'done'"
-                    width="13"
-                    height="13"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    class="text-emerald-600"
-                  >
-                    <path d="M20 6 9 17l-5-5" />
-                  </svg>
-                  <svg v-else width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4z" />
-                  </svg>
-                  调用 {{ tc.name }}
-                </span>
-              </div>
-
-              <!-- 思考过程：只在深度档且后端真的返回了 reasoning 时出现；出正文后自动收起，可手动展开回看 -->
-              <div v-if="m.reasoning" class="mb-2 overflow-hidden rounded-xl border border-stone-200/80 bg-stone-50/70">
+            <div v-else class="group w-full min-w-0">
+              <!-- 分析过程：思考增量 + 工具调用状态；出正文后自动收起，可手动展开回看 -->
+              <div v-if="m.reasoning || m.toolCalls.length" class="mb-2 overflow-hidden rounded-xl border border-stone-200/80 bg-stone-50/70">
                 <button
                   type="button"
                   @click="toggleReasoning(i, m)"
@@ -706,8 +682,14 @@ onBeforeUnmount(() => {
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M12 3a6 6 0 0 0-3.5 10.9c.4.3.6.7.6 1.1h5.8c0-.4.2-.8.6-1.1A6 6 0 0 0 12 3ZM9 18h6M10 21h4" />
                   </svg>
-                  {{ m.streaming && !m.content ? '思考中…' : '已完成思考' }}
-                  <span class="text-stone-400">· {{ m.reasoning.length }} 字</span>
+                  {{
+                    m.streaming && !m.content
+                      ? '分析中…'
+                      : m.citations.length
+                        ? '已完成分析，共参考' + m.citations.length + '篇资料'
+                        : '已完成分析，相关操作已执行'
+                  }}
+                  <span v-if="m.reasoning" class="text-stone-400">· {{ m.reasoning.length }} 字</span>
                   <svg
                     width="13"
                     height="13"
@@ -722,12 +704,67 @@ onBeforeUnmount(() => {
                     <path d="m6 9 6 6 6-6" />
                   </svg>
                 </button>
-                <p
+                <div
                   v-show="isReasoningOpen(i, m)"
                   :ref="(el) => setReasoningRef(i, el)"
                   @scroll="onReasoningScroll(i, $event)"
-                  class="max-h-64 overflow-y-auto scroll-thin whitespace-pre-wrap break-words px-3 pb-2.5 text-[12px] leading-[1.7] text-stone-500"
-                >{{ m.reasoning }}</p>
+                  class="max-h-64 overflow-y-auto scroll-thin px-3 pb-2.5 text-[12px] leading-[1.7] text-stone-500"
+                >
+                  <p v-if="m.reasoning" class="whitespace-pre-wrap break-words">{{ m.reasoning }}</p>
+                  <div v-if="m.toolCalls.length" class="mt-1 space-y-1.5">
+                    <div v-for="tc in m.toolCalls" :key="tc.callId || tc.name">
+                      <div class="flex items-center gap-2 text-[11.5px] text-stone-500">
+                        <span
+                          v-if="tc.state === 'running'"
+                          class="h-3 w-3 shrink-0 animate-spin rounded-full border-[1.5px] border-stone-300 border-t-stone-600"
+                        ></span>
+                        <svg
+                          v-else
+                          width="13"
+                          height="13"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          class="shrink-0 text-emerald-600"
+                        >
+                          <path d="M20 6 9 17l-5-5" />
+                        </svg>
+                        <span class="min-w-0 truncate">
+                          {{ tc.state === 'running' ? '正在调用 ' + tc.name : tc.name + ' 调用完成' }}
+                        </span>
+                        <span v-if="tc.state === 'running'" class="dots"></span>
+                      </div>
+                      <div
+                        v-if="tc.state === 'done' && tc.name === 'web_search' && tc.citations.length"
+                        class="mt-1.5 flex flex-wrap gap-1.5 pl-5"
+                      >
+                        <template v-for="c in tc.citations" :key="c.index">
+                          <a
+                            v-if="safeSourceUrl(c.url)"
+                            :href="c.url"
+                            target="_blank"
+                            rel="noopener noreferrer nofollow"
+                            :title="c.url"
+                            class="inline-flex max-w-[240px] items-center gap-1.5 rounded-full border border-stone-200 bg-white px-2 py-0.5 text-[11px] text-stone-600 transition hover:border-stone-300 hover:text-stone-900"
+                          >
+                            <SiteIcon :url="c.url" :size="14" />
+                            <span class="truncate">{{ c.title || sourceDomain(c.url) || c.url }}</span>
+                          </a>
+                          <span
+                            v-else
+                            class="inline-flex max-w-[240px] items-center gap-1.5 rounded-full border border-stone-200 bg-white px-2 py-0.5 text-[11px] text-stone-500"
+                          >
+                            <SiteIcon :url="c.url" :size="14" />
+                            <span class="truncate">{{ c.title || c.url }}</span>
+                          </span>
+                        </template>
+                      </div>
+                    </div>
+                  </div>
+                </div>
               </div>
 
               <!-- 正文：自定义排版 + [n] 引用徽标 + 代码块复制 -->
@@ -905,7 +942,7 @@ onBeforeUnmount(() => {
     <!-- 新对话：ChatGPT 式空白画布，问候语贴着输入框上方，整体靠上下两个间隔顶到视觉中部 -->
     <div v-else class="flex-[5] min-h-0 flex flex-col items-center justify-end px-6 pb-7">
       <h1 class="text-[22px] leading-tight font-medium tracking-tight text-stone-800">
-        {{ user?.username ? `${user.username}，想聊点什么？` : '想聊点什么？' }}
+        {{ (user?.nickname || user?.username) ? `${user.nickname || user.username}，想聊点什么？` : '想聊点什么？' }}
       </h1>
     </div>
 
@@ -919,6 +956,8 @@ onBeforeUnmount(() => {
           <textarea
             v-model="draft"
             @keydown="onKeydown"
+            @compositionstart="composing = true"
+            @compositionend="onCompositionEnd"
             rows="2"
             :placeholder="busy ? '正在回答中，可以先输入下一条…' : '随便问点什么，或描述你想构建的东西…'"
             class="w-full resize-none bg-transparent px-5 pt-4 pb-1.5 text-[14px] leading-relaxed text-stone-800 placeholder:text-stone-400 outline-none"

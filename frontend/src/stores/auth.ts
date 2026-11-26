@@ -21,6 +21,11 @@ function setError(e: unknown) {
   error.value = e instanceof Error ? e.message : '操作失败，请稍后重试'
 }
 
+/** 服务端返回的资料更新直接覆盖本地用户态（readonly 只挡模板外改引用，这里在 store 内部写） */
+function setUser(next: User): void {
+  user.value = next
+}
+
 /** 用账号+密码换取 token 并拉取用户信息，成功后写入 user */
 async function login(account: string, password: string): Promise<boolean> {
   loading.value = true
@@ -91,6 +96,7 @@ export function useAuth() {
     error: readonly(error),
     isLoggedIn,
     isAdmin,
+    setUser,
     login,
     register,
     logout,

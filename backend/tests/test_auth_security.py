@@ -1,7 +1,10 @@
 """auth 安全模块单元测试：密码哈希与 JWT（不依赖 MySQL）"""
 
 import jwt
+import pytest
+from pydantic import ValidationError
 
+from auth.schemas import ChangePasswordRequest, UpdateProfileRequest
 from auth.security import (
     create_access_token,
     decode_access_token,
@@ -54,3 +57,22 @@ def test_hash_token_stable_and_hex():
     assert h1 != hash_token(generate_refresh_token())  # 不同令牌哈希不同
     assert len(h1) == 64  # sha256 十六进制摘要
     assert all(c in "0123456789abcdef" for c in h1)
+
+
+def test_update_profile_schema_validation():
+    assert UpdateProfileRequest().nickname is None  # 未提交的字段不动
+    assert UpdateProfileRequest(nickname="  新昵称  ").nickname == "新昵称"
+    with pytest.raises(ValidationError):
+        UpdateProfileRequest(nickname="   ")
+    assert UpdateProfileRequest(avatar="").avatar == ""  # 空串表示清除头像
+    with pytest.raises(ValidationError):
+        UpdateProfileRequest(avatar="https://example.com/a.png")
+    with pytest.raises(ValidationError):
+        UpdateProfileRequest(avatar="data:text/plain;base64,YQ==")
+    with pytest.raises(ValidationError):
+        UpdateProfileRequest(avatar="data:image/png;base64," + "a" * (2 * 1024 * 1024))
+
+
+def test_change_password_schema_validation():
+    with pytest.raises(ValidationError):
+        ChangePasswordRequest(old_password="old", new_password="12345")

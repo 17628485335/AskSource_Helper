@@ -12,6 +12,9 @@ export interface User {
   id: number
   username: string
   email: string
+  nickname: string
+  /** 压缩后的图片 data URL；空串表示未设置头像 */
+  avatar: string
   is_active: boolean
   /** 仅管理员能配模型密钥（/settings/llm 读写），普通用户只能选模型 */
   is_admin: boolean
@@ -285,6 +288,24 @@ export function login(payload: { account: string; password: string }) {
 
 export function getMe(): Promise<User> {
   return request<User>('/auth/me', { withAuth: true })
+}
+
+/** 修改昵称 / 头像（未提交的字段保持不变） */
+export function updateProfile(payload: { nickname?: string; avatar?: string }) {
+  return request<User>('/auth/me', {
+    method: 'PATCH',
+    withAuth: true,
+    body: JSON.stringify(payload),
+  })
+}
+
+/** 修改密码：成功后服务端的 refresh 全部吊销，前端应回到登录态 */
+export function changePassword(payload: { old_password: string; new_password: string }) {
+  return request<{ message: string }>('/auth/password', {
+    method: 'POST',
+    withAuth: true,
+    body: JSON.stringify(payload),
+  })
 }
 
 /** 登出：吊销服务端 refresh（后端清 Cookie），失败静默 */

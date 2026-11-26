@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from typing import Annotated, Any, ClassVar
 from urllib.parse import unquote, urlparse
 
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, InjectedToolCallId
 from langgraph.prebuilt.tool_node import InjectedState
 from pydantic import BaseModel, Field
 
@@ -25,7 +25,7 @@ from app.settings.search import (
     tavily_extract,
 )
 
-from .citations import Citation, build_artifact, citation_offset
+from .citations import Citation, build_artifact, citation_start
 
 # 单页正文送给模型的上限。一页 markdown 轻松上万字，几页就能把上下文顶满，
 # 而且之后每一轮都要把这些字重新发一遍。
@@ -45,6 +45,8 @@ class ReadUrlArgs(BaseModel):
         description="可选：只关心某个具体问题时填它，上游只回相关片段而不是整页正文",
     )
     state: Annotated[dict, InjectedState] = Field(default_factory=dict)
+    # 并行调用时按 tool_call 顺序预留引用号段
+    tool_call_id: Annotated[str, InjectedToolCallId] = Field(default="")
 
 
 def _clean(text: str) -> str:
@@ -119,7 +121,11 @@ class ReadUrlTool(BaseTool):
         return search_enabled()
 
     async def _arun(  # type: ignore[override]
-        self, urls: list[str], query: str = "", state: dict | None = None
+        self,
+        urls: list[str],
+        query: str = "",
+        state: dict | None = None,
+        tool_call_id: str = "",
     ) -> tuple[str, dict[str, Any]]:
         try:
             pages, failed = await tavily_extract(urls or [], query=query or "")
@@ -136,11 +142,15 @@ class ReadUrlTool(BaseTool):
                 build_artifact([], tool=self.name),
             )
 
-        start = citation_offset(state) + 1
+        start = citation_start(state or {}, tool_call_id)
         text, citations = format_pages(pages, failed, start=start)
         return text, build_artifact(citations, query=(query or "").strip(), tool=self.name)
 
     def _run(  # type: ignore[override]
-        self, urls: list[str], query: str = "", state: dict | None = None
+        self,
+        urls: list[str],
+        query: str = "",
+        state: dict | None = None,
+        tool_call_id: str = "",
     ) -> tuple[str, dict[str, Any]]:
         raise NotImplementedError("read_url 只提供异步实现，请用 ainvoke/astream")

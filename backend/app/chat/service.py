@@ -32,6 +32,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from app.agents import service as agent_service
+from app.context.assembler import build_context
 from app.session import service as session_service
 from app.workspace import service as workspace_service
 
@@ -66,6 +67,8 @@ async def astream_chat(
 
     ctx: agent_service.AgentContext | None = None
     tool_names: list[str] | None = None
+    context_messages: list[Any] = []
+    context_sections: list[str] = []
 
     # 阶段一：解析 agent 配置、挑模型、准备会话与历史
     async with AsyncSessionLocal() as db:
@@ -136,9 +139,24 @@ async def astream_chat(
         turn_id = user_message.id if user_message is not None else None
         history = await session_service.load_history(db, sid)
 
+        # Phase 4：agent 决定注入哪些段；用户资料只按 user_id 读取，不写进 agent 配置
+        if ctx is not None:
+            try:
+                bundle = await build_context(db, ctx, user_id=user_id, session_id=sid)
+                context_messages = bundle.messages
+                context_sections = bundle.section_keys
+            except Exception:
+                # 上下文装配失败不该让对话不可用；没有上下文段时仍走原模型链路
+                context_messages = []
+                context_sections = []
+
     meta_extras: dict[str, Any] = {}
     if ctx is not None:
-        meta_extras = {"agent_key": ctx.agent_key, "prompt_version": ctx.prompt_version}
+        meta_extras = {
+            "agent_key": ctx.agent_key,
+            "prompt_version": ctx.prompt_version,
+            "context_sections": context_sections,
+        }
     yield {"type": "meta", "session_id": sid, **agent.descriptor(use_thinking), **meta_extras}
 
     # 阶段二：流式调用模型（不持有数据库连接）
@@ -214,6 +232,8 @@ async def astream_chat(
         }
         if tool_names is not None:
             astream_kwargs["tool_names"] = tool_names
+        if context_messages:
+            astream_kwargs["context_messages"] = context_messages
         async for event in agent.astream(history, **astream_kwargs):
             kind = event["type"]
 

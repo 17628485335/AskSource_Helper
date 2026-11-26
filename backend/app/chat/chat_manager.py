@@ -55,7 +55,6 @@ import time
 from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import datetime
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
 from sqlalchemy import select
@@ -73,6 +72,13 @@ from app.graph.stream_protocol import (
     ev_tool_end,
     ev_tool_start,
 )
+from app.prompt import (
+    build_system_prompt,
+    date_line,
+    prompt_contains_sections,
+    strip_duplicate_section_headers,
+)
+from app.prompt import LOCAL_TZ as LOCAL_TZ  # noqa: F401  兼容测试导入
 from app.settings.llm import build_model, get_llm_settings
 from app.settings.models import LlmProvider
 from app.tools.citations import extract_citations
@@ -84,13 +90,6 @@ DEFAULT_SYSTEM_PROMPT = (
     "需要外部信息或执行操作时优先调用已提供的工具，不要编造结果。"
     "引用只在正文里用 [n] 标注，不要在末尾另列“参考来源”清单，界面会单独展示。"
 )
-
-# 提示词里的「今天」按北京墙钟算：容器与 MySQL 默认常年 UTC（本项目已踩过一次
-# 落库时间少 8 小时的坑），直接 date.today() 会让模型把时间算早，跨零点差一整天
-LOCAL_TZ = ZoneInfo("Asia/Shanghai")
-_WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-# 会产出引用编号的工具：只有它们在场才提 [n] 约定，否则模型会在回答里凭空写编号
-CITATION_TOOLS = frozenset({"web_search", "read_url"})
 
 # tool_end.preview 的截断长度：够前端 tooltip/展开区用，又不会把整页搜索原文推过网络
 PREVIEW_CHARS = 400
@@ -183,33 +182,14 @@ def filter_tools_by_call_limit(
     ]
 
 
-def date_line(now: datetime | None = None) -> str:
-    """「今天是 2026-11-25 周三（北京时间）。」单独成函数便于测试与换时区"""
-    moment = (now or datetime.now(LOCAL_TZ)).astimezone(LOCAL_TZ)
-    return f"今天是 {moment:%Y-%m-%d} {_WEEKDAYS[moment.weekday()]}（北京时间）。"
-
-
 def compose_system_prompt(
     prompt: str,
     tool_names: Iterable[str] = (),
     *,
     now: datetime | None = None,
 ) -> str:
-    """把时效上下文拼到系统提示词尾部；传空串代表本轮不带系统消息，原样返回空。
-
-    每轮现拼而不是建池时算死：模型池是进程常驻的，写死的日期跳天就错，
-    而联网搜索恰恰最依赖「今天是哪天」（否则模型会把旧闻当成现状）。
-    """
-    if not (prompt or "").strip():
-        return ""
-    lines = [prompt.rstrip(), "", date_line(now)]
-    if set(tool_names) & CITATION_TOOLS:
-        lines.append(
-            "需要最新或你无法核实的信息时调用 web_search / read_url，"
-            "并在回答中用它们返回的编号 [n] 标注参考来源；"
-            "不要在末尾另列“参考来源”清单，界面会单独展示。"
-        )
-    return "\n".join(lines)
+    """兼容旧调用；实际拼装逻辑在 app.prompt.build_system_prompt。"""
+    return build_system_prompt(prompt, tool_names, now=now, date_line_fn=date_line)
 
 
 # 池里的索引：(平台, 模型)。一个模型一份图，思考态不在键里
@@ -395,6 +375,7 @@ class ModelAgent:
         system_prompt: str | None = None,
         thinking: bool = False,
         tool_names: Sequence[str] | None = None,
+        context_messages: Sequence[Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """只发起一次 astream_events(v2)，把图事件逐个翻译成协议事件：
         产出 segment_start* / token* / reasoning* / tool_start* / tool_end* / citations*。
@@ -411,6 +392,7 @@ class ModelAgent:
         thinking 走 context 交给图里的中间件：True 且该行支持深度思考时才换成深度态模型
         （实测 astream_events 的 context kwarg 原样到达 request.runtime.context）。
         tool_names 同理：None=模型池全部工具，[]=禁用所有工具，列表=只给白名单。
+        context_messages 是 Phase 4 装配出的上下文段，紧跟系统提示词、位于历史之前。
 
         reasoning 是思考增量（只在深度档出现），来自 ReasoningChatOpenAI 接住的
         reasoning_content，与正文 token 分事件下发，不进回答文本也不落库。
@@ -438,12 +420,31 @@ class ModelAgent:
             if tool_names is not None
             else [getattr(tool, "name", "") for tool in self.tools]
         )
-        prompt = compose_system_prompt(
+        prompt = build_system_prompt(
             self.system_prompt if system_prompt is None else system_prompt,
             visible_tool_names,
+            date_line_fn=date_line,
         )
         turns = [m for m in history if not isinstance(m, SystemMessage)]
-        messages = [SystemMessage(content=prompt), *turns] if prompt else [*turns]
+        context_blocks = list(context_messages or [])
+        # 生成后的系统提示词已含完整分段正文，就不再重复注入分段；
+        # 只带标签但缺正文时，仅去掉重复表头，保留上下文正文。
+        if prompt and context_blocks:
+            block_text = "\n".join(str(getattr(m, "content", "")) for m in context_blocks)
+            if prompt_contains_sections(prompt, block_text):
+                context_blocks = []
+        if prompt and context_blocks:
+            rewritten: list[Any] = []
+            for message in context_blocks:
+                if isinstance(message, SystemMessage):
+                    original = str(getattr(message, "content", ""))
+                    cleaned = strip_duplicate_section_headers(original, prompt)
+                    if cleaned != original:
+                        message = SystemMessage(content=cleaned)
+                rewritten.append(message)
+            context_blocks = rewritten
+        head = [SystemMessage(content=prompt)] if prompt else []
+        messages = [*head, *context_blocks, *turns]
         async for ev in self.agent.astream_events(
             {"messages": messages},
             version="v2",

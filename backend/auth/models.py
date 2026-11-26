@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
@@ -17,6 +17,9 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     hashed_password: Mapped[str] = mapped_column(String(255))
+    # 昵称留空时前端回退显示 username；头像存压缩后的 data URL（避免引入文件存储）
+    nickname: Mapped[str] = mapped_column(String(64), default="")
+    avatar: Mapped[str] = mapped_column(Text, default="")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     # 只有管理员能配模型密钥（llm_providers 现在全库生效，一人改动影响所有人）
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import models, schemas
@@ -198,3 +198,48 @@ async def logout(
 @router.get("/me", response_model=schemas.UserOut, summary="获取当前登录用户")
 async def me(current_user: models.User = Depends(get_current_user)):
     return current_user
+
+
+@router.patch("/me", response_model=schemas.UserOut, summary="修改昵称或头像")
+async def update_me(
+    payload: schemas.UpdateProfileRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """只改提交了的字段；头像存前端压缩后的 data URL，空串表示清除"""
+    if payload.nickname is not None:
+        current_user.nickname = payload.nickname
+    if payload.avatar is not None:
+        current_user.avatar = payload.avatar
+    await db.commit()
+    await db.refresh(current_user)
+    return current_user
+
+
+@router.post("/password", summary="修改密码")
+async def change_password(
+    payload: schemas.ChangePasswordRequest,
+    response: Response,
+    current_user: models.User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """校验旧密码后更新哈希，并吊销该用户所有 refresh，迫使其重新登录"""
+    ok = await run_in_threadpool(
+        verify_password, payload.old_password, current_user.hashed_password
+    )
+    if not ok:
+        # 用 400 而非 401：401 会让前端以为 token 过期、自动刷新重试
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="当前密码不正确"
+        )
+    current_user.hashed_password = await run_in_threadpool(
+        hash_password, payload.new_password
+    )
+    await db.execute(
+        update(models.RefreshToken)
+        .where(models.RefreshToken.user_id == current_user.id)
+        .values(revoked=True)
+    )
+    await db.commit()
+    response.delete_cookie(key=REFRESH_COOKIE_NAME, path=REFRESH_COOKIE_PATH)
+    return {"message": "密码已修改，请重新登录"}

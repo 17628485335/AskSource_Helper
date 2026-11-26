@@ -12,20 +12,19 @@
 from collections.abc import Sequence
 from typing import Annotated, Any, ClassVar
 
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, InjectedToolCallId
 from langgraph.prebuilt.tool_node import InjectedState
 from pydantic import BaseModel, Field
 
 from app.graph.tools import ToolCategory, register_tool
 from app.settings.search import SearchError, SearchResult, search_enabled, tavily_search
 
-from .citations import Citation, build_artifact, citation_offset
+from .citations import MAX_SEARCH_RESULTS, Citation, build_artifact, citation_start
 
 # 单条摘要的截断长度。搜索引擎一条结果动辄上千字，全塞进 ReAct 上下文既淹没模型，
 # 又会让这一轮之后的每次模型调用都变贵（工具结果会留在消息里反复送上去）。
 SNIPPET_LIMIT = 300
-# 允许模型指定的最大条数，超过就夹回来
-MAX_RESULTS_LIMIT = 5
+MAX_RESULTS_LIMIT = MAX_SEARCH_RESULTS
 
 
 class WebSearchArgs(BaseModel):
@@ -43,6 +42,8 @@ class WebSearchArgs(BaseModel):
         default=3, description=f"返回几条结果，1~{MAX_RESULTS_LIMIT} 条，默认 3 条"
     )
     state: Annotated[dict, InjectedState] = Field(default_factory=dict)
+    # 并行调用时靠它算出自己在本批 tool_calls 里的位置，预分配不重叠的引用编号
+    tool_call_id: Annotated[str, InjectedToolCallId] = Field(default="")
 
 
 def format_results(
@@ -102,7 +103,11 @@ class WebSearchTool(BaseTool):
         return search_enabled()
 
     async def _arun(  # type: ignore[override]
-        self, query: str, max_results: int = 3, state: dict | None = None
+        self,
+        query: str,
+        max_results: int = 3,
+        state: dict | None = None,
+        tool_call_id: str = "",
     ) -> tuple[str, dict[str, Any]]:
         # 夹而不是拒：模型给的条数不可靠，但「想要更多结果」的意图是清楚的
         try:
@@ -127,13 +132,17 @@ class WebSearchTool(BaseTool):
                 build_artifact([], tool=self.name),
             )
 
-        # 编号接着本轮已用过的最大值往下排，模型连搜两次也不会出现两个 [1]
-        start = citation_offset(state) + 1
+        # 同批并行搜索按 tool_call 顺序预留号段，连搜两次也不会出现两个 [1]
+        start = citation_start(state or {}, tool_call_id)
         text, citations = format_results(query.strip(), results, start=start)
         return text, build_artifact(citations, query=query.strip(), tool=self.name)
 
     def _run(  # type: ignore[override]
-        self, query: str, max_results: int = 3, state: dict | None = None
+        self,
+        query: str,
+        max_results: int = 3,
+        state: dict | None = None,
+        tool_call_id: str = "",
     ) -> tuple[str, dict[str, Any]]:
         # 整条链路都是 async（FastAPI + 异步 DB + astream），create_agent 走的是 _arun。
         # 留个明确的报错而不是静默返回空文本，免得将来有人同步调用时以为「搜索坏了」。

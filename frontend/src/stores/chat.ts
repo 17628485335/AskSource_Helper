@@ -16,6 +16,8 @@ export interface ToolCall {
   name: string
   input: Record<string, unknown>
   state: 'running' | 'done'
+  /** 该次工具调用产生的引用（网页搜索完成后可据此展示站点图标与标题） */
+  citations: ChatCitation[]
 }
 
 export interface ChatMessage {
@@ -56,6 +58,19 @@ const startedAt = ref(0)
 let controller: AbortController | null = null
 
 const hasConversation = computed(() => messages.value.length > 0)
+
+/** 后端 citations_json 的条目做一次收敛，避免历史/实时两条路径字段处理不一致 */
+function normalizeCitation(raw: Partial<ChatCitation>): ChatCitation | null {
+  if (typeof raw.index !== 'number') return null
+  return {
+    index: raw.index,
+    title: typeof raw.title === 'string' ? raw.title : '',
+    url: typeof raw.url === 'string' ? raw.url : '',
+    snippet: typeof raw.snippet === 'string' ? raw.snippet : '',
+    published_date: typeof raw.published_date === 'string' ? raw.published_date : '',
+    kind: typeof raw.kind === 'string' ? raw.kind : '',
+  }
+}
 
 /** 新建一条气泡：字段集中在这里，避开新增状态时某处漏填 */
 function newMessage(
@@ -104,6 +119,7 @@ function applyEvent(event: ChatEvent, bubble: ChatMessage) {
           name: event.tool,
           input: event.input,
           state: 'running',
+          citations: [],
         })
       }
       break
@@ -119,16 +135,21 @@ function applyEvent(event: ChatEvent, bubble: ChatMessage) {
           name: event.tool,
           input: {},
           state: 'done',
+          citations: [],
         })
       break
     }
     case 'citations':
       // 一次工具调用一帧，多轮搜索累加；编号由后端从本轮已用号后续，所以按 index 去重而不是 url
       // （同一个地址被搜到一次、又被 read_url 打开一次时，两条正文不同、[n] 也不同）
+      const callKey = event.call_id || event.tool
+      const call = bubble.toolCalls.find((c) => (c.callId || c.name) === callKey)
       for (const item of event.items) {
         if (!bubble.citations.some((c) => c.index === item.index)) bubble.citations.push(item)
+        if (call && !call.citations.some((c) => c.index === item.index)) call.citations.push(item)
       }
       bubble.citations.sort((a, b) => a.index - b.index)
+      if (call) call.citations.sort((a, b) => a.index - b.index)
       break
     case 'done':
       // 正常情况下增量已拼好；done 兜底（例如增量丢失但整段返回）
@@ -190,22 +211,25 @@ async function loadSession(
     .map((r) => {
       const msg = newMessage(r.role as 'user' | 'assistant', r.content, r.created_at)
       if (r.role === 'assistant') {
-        // 历史会话的引用来自 chat_tool_calls.citations_json；按 [n] 去重，与实时流一致
+        // 历史会话的工具调用与引用都来自 chat_tool_calls；按 [n] 去重，与实时流一致
         const seen = new Set<number>()
         for (const tc of r.tool_calls ?? []) {
+          const callCitations: ChatCitation[] = []
           for (const raw of tc.citations_json ?? []) {
-            const item = raw as Partial<ChatCitation>
-            if (typeof item.index !== 'number' || seen.has(item.index)) continue
+            const item = normalizeCitation(raw as Partial<ChatCitation>)
+            if (!item) continue
+            callCitations.push(item)
+            if (seen.has(item.index)) continue
             seen.add(item.index)
-            msg.citations.push({
-              index: item.index,
-              title: typeof item.title === 'string' ? item.title : '',
-              url: typeof item.url === 'string' ? item.url : '',
-              snippet: typeof item.snippet === 'string' ? item.snippet : '',
-              published_date: typeof item.published_date === 'string' ? item.published_date : '',
-              kind: typeof item.kind === 'string' ? item.kind : '',
-            })
+            msg.citations.push(item)
           }
+          msg.toolCalls.push({
+            callId: tc.call_id,
+            name: tc.tool_name,
+            input: (tc.input_json as Record<string, unknown>) ?? {},
+            state: 'done',
+            citations: callCitations.sort((a, b) => a.index - b.index),
+          })
         }
         msg.citations.sort((a, b) => a.index - b.index)
       }

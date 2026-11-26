@@ -271,8 +271,13 @@ async def truncate_last_turn(
 def to_lc_messages(rows: Sequence[ChatMessage]) -> list[Any]:
     """把 ORM 消息行转成 langchain 消息对象（惰性导入，未装 langchain 也不影响本模块导入）
 
-    tools 角色跳过：langchain 的 ToolMessage 必须携带 tool_call_id，
-    当前表结构没存，硬塞会让后续请求被上游判为非法上下文。
+    tools 角色跳过：chat_tool_calls 里已经保存了 call_id / result_text / input_json，
+    但本函数只接收 ChatMessage 行，没有把 ChatToolCall 重建成 ToolMessage，
+    也没有还原 AIMessage.tool_calls。孤立的 ToolMessage 缺少配对的 tool_call_id
+    和前置 AIMessage.tool_calls，硬塞会被上游判为非法上下文。
+
+    要恢复完整工具上下文，必须按 segment_id / seq 成对构造：
+    AIMessage(tool_calls=[...]) + ToolMessage(tool_call_id=..., content=...)。
     """
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
