@@ -84,15 +84,20 @@ async def astream_chat(
             except Exception:
                 ctx = None
 
+            pool = await ChatManager.get(db)
             if ctx is not None:
                 platform = ctx.platform or platform
                 model = ctx.model or model
                 if thinking is None:
                     thinking = ctx.thinking
-                system_prompt = ctx.system_prompt or system_prompt
+                if ctx.system_prompt:
+                    cached = pool.prompt_cache.get(ctx.agent_key)
+                    if cached is None or cached[0] != ctx.prompt_hash:
+                        cached = (ctx.prompt_hash, ctx.system_prompt)
+                        pool.prompt_cache[ctx.agent_key] = cached
+                    system_prompt = cached[1]
                 tool_names = ctx.tool_names
 
-            pool = await ChatManager.get(db)
             agent = pool.pick(platform=platform, model=model)
             use_thinking = agent.effective_thinking(thinking)
         except ChatConfigError as exc:

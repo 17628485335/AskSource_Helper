@@ -70,5 +70,6 @@ class AgentPromptOut(BaseModel):
     agent_id: int
     version: int
     system_prompt: str
+    prompt_hash: str
     note: str
     created_at: datetime

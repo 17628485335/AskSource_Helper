@@ -56,6 +56,7 @@ class AgentPrompt(Base):
     )
     version: Mapped[int] = mapped_column(Integer)
     system_prompt: Mapped[str] = mapped_column(Text)
+    prompt_hash: Mapped[str] = mapped_column(String(64), default="", index=True)
     note: Mapped[str] = mapped_column(String(255), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

@@ -4,6 +4,7 @@ chat_manager 每轮调用本函数生成最终注入的 SystemMessage；管理�
 「生成系统提示词」接口也调用它，保证预览和运行时完全一致。
 """
 
+import hashlib
 import re
 from collections.abc import Iterable
 from datetime import datetime
@@ -11,11 +12,16 @@ from zoneinfo import ZoneInfo
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 _WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-CITATION_TOOLS = frozenset({"web_search", "read_url"})
-CITATION_HINT = (
+# 仅用于从旧提示词中剥掉，不再新增到生成的提示词里
+LEGACY_CITATION_HINT = (
     "需要最新或你无法核实的信息时调用 web_search / read_url，"
     "并在回答中用它们返回的编号 [n] 标注参考来源；"
     "不要在末尾另列“参考来源”清单，界面会单独展示。"
+)
+LEGACY_DEFAULT_PROMPT = (
+    "你是 AskSource 助手。回答要简洁、直接；"
+    "需要外部信息或执行操作时优先调用已提供的工具，不要编造结果。"
+    "引用只在正文里用 [n] 标注，不要在末尾另列“参考来源”清单，界面会单独展示。"
 )
 _DATE_LINE_RE = re.compile(r"^今天是 \d{4}-\d{2}-\d{2} 周[一二三四五六日]（北京时间）。$")
 
@@ -54,6 +60,31 @@ def date_line(now: datetime | None = None) -> str:
     return f"今天是 {moment:%Y-%m-%d} {_WEEKDAYS[moment.weekday()]}（北京时间）。"
 
 
+def strip_trailing_date(prompt: str) -> str:
+    """只去掉末尾日期，保留提示词正文和分段，用于计算稳定的 prompt hash。"""
+    lines = (prompt or "").rstrip().splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and _DATE_LINE_RE.match(lines[-1].strip()):
+        lines.pop()
+        while lines and not lines[-1].strip():
+            lines.pop()
+    return "\n".join(lines).rstrip()
+
+
+def compute_prompt_hash(prompt: str) -> str:
+    """agent_prompts 保存时算好的稳定 hash；不含每天变化的日期行。"""
+    return hashlib.sha256(strip_trailing_date(prompt).encode("utf-8")).hexdigest()
+
+
+def strip_legacy_default_prompt(prompt: str) -> str:
+    """生成时剥掉旧版默认文案，避免继续带进系统提示词。"""
+    text = prompt or ""
+    if text.startswith(LEGACY_DEFAULT_PROMPT):
+        text = text[len(LEGACY_DEFAULT_PROMPT):].lstrip("\n")
+    return text
+
+
 def _strip_composed_suffix(prompt: str) -> str:
     """去掉已拼过的分段块、日期行和引用规则，避免保存后再生成时重复拼接。"""
     lines = prompt.rstrip().splitlines()
@@ -64,7 +95,7 @@ def _strip_composed_suffix(prompt: str) -> str:
             break
     while lines and not lines[-1].strip():
         lines.pop()
-    if lines and lines[-1].strip() == CITATION_HINT:
+    if lines and lines[-1].strip() == LEGACY_CITATION_HINT:
         lines.pop()
         while lines and not lines[-1].strip():
             lines.pop()
@@ -77,34 +108,39 @@ def _strip_composed_suffix(prompt: str) -> str:
 
 def build_system_prompt(
     prompt: str,
-    tool_names: Iterable[str] = (),
+    _tool_names: Iterable[str] = (),
     *,
     sections: Iterable[tuple[str, str, str, str]] | None = None,
     now: datetime | None = None,
     date_line_fn=None,
 ) -> str:
-    """把时效信息、工具引用规则和按预设顺序排列的分段拼到基础提示词后。
+    """把按预设顺序排列的分段和当天日期拼到基础提示词后。
 
+    日期放在最后：它每天变化，放前面会让稳定前缀缓存失效。
     `sections` 传 (key, trust_level, content, hint)，顺序由调用方按已保存的
     priority 排好；content 直接写在对应 `[TAG] 文案` 表头下面，hint 就是 binding
     里保存的中文描述。函数幂等：传入已拼好的提示词会先去掉旧后缀再按当前状态重拼。
-    传空 prompt 返回空串。
+    基础提示词为空但仍传了 sections 时，只生成分段和日期；两者都为空时返回空串。
+    `_tool_names` 保留为兼容参数，不再往提示词里追加工具/引用说明。
     date_line_fn 仅用于测试注入；正常调用不需要传。
     """
     base = _strip_composed_suffix(prompt or "")
-    if not base.strip():
+    section_list = list(sections or [])
+    if not base.strip() and not section_list:
         return ""
     make_date_line = date_line_fn or date_line
-    lines = [base, "", make_date_line(now)]
-    if set(tool_names) & CITATION_TOOLS:
-        lines.append(CITATION_HINT)
-    if sections:
-        lines.append("")
-        for key, trust, content, hint in sections:
+    lines = [base] if base.strip() else []
+    if section_list:
+        if lines:
+            lines.append("")
+        for key, trust, content, hint in section_list:
             lines.append(section_header(key, trust, hint))
             if (content or "").strip():
                 lines.append(content.rstrip())
             lines.append("")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    lines.extend(["", make_date_line(now)])
     return "\n".join(lines).rstrip()
 
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import { useLlm, PLATFORM_PRESET, type LlmProviderConfig } from '../stores/llm'
 import { useAuth } from '../stores/auth'
 import * as authApi from '../api/auth'
@@ -97,6 +97,20 @@ const agentTools = ref<ToolDto[]>([])
 const agentLoading = ref(false)
 const agentError = ref('')
 const agentSaved = ref('')
+const saveToast = ref('')
+let saveToastTimer: number | undefined
+
+function showSaveToast(message: string) {
+  saveToast.value = message
+  if (saveToastTimer) window.clearTimeout(saveToastTimer)
+  saveToastTimer = window.setTimeout(() => {
+    saveToast.value = ''
+  }, 3000)
+}
+
+onUnmounted(() => {
+  if (saveToastTimer) window.clearTimeout(saveToastTimer)
+})
 const agentFormOpen = ref(false)
 const agentEditingId = ref<number | null>(null)
 const agKey = ref('')
@@ -291,7 +305,7 @@ const contextGroups = computed<ContextGroup[]>(() => [
   {
     key: 'memory',
     label: '长期记忆',
-    description: '跨会话记忆，当前为预留位；只能配置是否注入与预算。',
+    description: '跨会话记忆；输入框失焦后自动保存。',
     addResolver: 'memory',
     drafts: contextDrafts.value.filter(
       (d) => MEMORY_CONTEXT_KEYS.includes(d.key) || d.resolver === 'memory',
@@ -534,6 +548,31 @@ async function generateSystemPrompt() {
   }
 }
 
+/** 上下文保存后重新生成提示词并落库，保证 agent_prompts.hash 与上下文同步 */
+async function regenerateAndSavePrompt(agentId: number, note: string) {
+  try {
+    const selectedTools =
+      agToolMode.value === 'picked'
+        ? agToolNames.value
+        : agentTools.value.map((t) => t.name)
+    const result = await composeSystemPrompt({
+      prompt: agPrompt.value,
+      agent_id: agentId,
+      tool_names: selectedTools,
+    })
+    agPrompt.value = result.content
+    await createAgentPrompt(agentId, {
+      system_prompt: result.content,
+      note,
+      activate: true,
+    })
+    await loadAgentPrompts(agentId)
+    void loadChatAgents(true)
+  } catch (e) {
+    systemPromptError.value = e instanceof Error ? e.message : '上下文变更后生成提示词失败'
+  }
+}
+
 async function saveSystemPromptPreview() {
   const id = agentEditingId.value
   if (id === null || !agPrompt.value.trim() || systemPromptSaving.value) return
@@ -609,6 +648,7 @@ async function addMemoryDraft() {
     const created = await createAgentMemory(agentEditingId.value, '')
     memoryDrafts.value.push(created)
     contextSaved.value.memory = '已新增空白记忆'
+    void regenerateAndSavePrompt(agentEditingId.value, '记忆变更后自动生成')
   } catch (e) {
     contextGenerateError.value = e instanceof Error ? e.message : '新增记忆失败'
   }
@@ -621,20 +661,9 @@ async function updateMemoryContent(memory: AgentMemoryDto, content: string) {
     const updated = await updateAgentMemory(agentEditingId.value, memory.id, { content })
     const index = memoryDrafts.value.findIndex((m) => m.id === memory.id)
     if (index >= 0) memoryDrafts.value[index] = updated
+    void regenerateAndSavePrompt(agentEditingId.value, '记忆内容变更后自动生成')
   } catch (e) {
     contextGenerateError.value = e instanceof Error ? e.message : '保存记忆失败'
-  }
-}
-
-async function toggleMemoryEnabled(memory: AgentMemoryDto, enabled: boolean) {
-  if (agentEditingId.value === null) return
-  contextGenerateError.value = ''
-  try {
-    const updated = await updateAgentMemory(agentEditingId.value, memory.id, { enabled })
-    const index = memoryDrafts.value.findIndex((m) => m.id === memory.id)
-    if (index >= 0) memoryDrafts.value[index] = updated
-  } catch (e) {
-    contextGenerateError.value = e instanceof Error ? e.message : '更新记忆状态失败'
   }
 }
 
@@ -644,6 +673,7 @@ async function removeMemoryDraft(memory: AgentMemoryDto) {
   try {
     await deleteAgentMemory(agentEditingId.value, memory.id)
     memoryDrafts.value = memoryDrafts.value.filter((m) => m.id !== memory.id)
+    void regenerateAndSavePrompt(agentEditingId.value, '记忆删除后自动生成')
   } catch (e) {
     contextGenerateError.value = e instanceof Error ? e.message : '删除记忆失败'
   }
@@ -659,6 +689,7 @@ async function saveContextGroup(groupKey: 'agent' | 'user' | 'memory') {
   try {
     await saveAgentContexts(agentEditingId.value, drafts)
     contextSaved.value[groupKey] = '已保存'
+    await regenerateAndSavePrompt(agentEditingId.value, '上下文保存后自动生成')
   } catch (e) {
     contextGenerateError.value = e instanceof Error ? e.message : '保存上下文失败'
   } finally {
@@ -729,6 +760,7 @@ async function saveContextOrder() {
     await saveAgentContexts(agentEditingId.value, contextDrafts.value)
     orderDirty.value = false
     orderSaved.value = '已保存拼接顺序'
+    await regenerateAndSavePrompt(agentEditingId.value, '排序调整后自动生成')
   } catch (e) {
     orderError.value = e instanceof Error ? e.message : '保存拼接顺序失败'
   } finally {
@@ -736,20 +768,21 @@ async function saveContextOrder() {
   }
 }
 
-function editAgent(agent: AgentDto) {
+async function editAgent(agent: AgentDto) {
   agentEditingId.value = agent.id
   agKey.value = agent.agent_key
   agName.value = agent.name
   agDescription.value = agent.description
   agToolMode.value = agent.tool_names === null ? 'all' : 'picked'
   agToolNames.value = [...(agent.tool_names ?? [])]
-  agPrompt.value = ''
-  agPromptNote.value = ''
   systemPromptError.value = ''
   agentSaved.value = ''
   agentError.value = ''
   agentFormOpen.value = true
-  void loadAgentPrompts(agent.id)
+  await loadAgentPrompts(agent.id)
+  const active = adminPrompts.value.find((p) => p.version === agent.active_prompt_version)
+  agPrompt.value = active?.system_prompt ?? ''
+  agPromptNote.value = active?.note ?? ''
   void loadAgentContext(agent.id)
 }
 
@@ -768,7 +801,6 @@ async function saveAgent() {
     return
   }
   const toolNames = agToolMode.value === 'all' ? null : agToolNames.value
-  const prompt = agPrompt.value.trim()
   try {
     if (agentEditingId.value === null) {
       const created = await createAgent({
@@ -776,7 +808,7 @@ async function saveAgent() {
         name: agName.value.trim(),
         description: agDescription.value.trim(),
         tool_names: toolNames,
-        system_prompt: prompt || undefined,
+        system_prompt: undefined,
       })
       agentEditingId.value = created.id
     } else {
@@ -786,13 +818,6 @@ async function saveAgent() {
         tool_names: toolNames,
         is_active: true,
       })
-      if (prompt) {
-        await createAgentPrompt(agentEditingId.value, {
-          system_prompt: prompt,
-          note: agPromptNote.value.trim() || undefined,
-          activate: true,
-        })
-      }
     }
     if (agentEditingId.value !== null) {
       await saveAgentContexts(agentEditingId.value)
@@ -800,7 +825,8 @@ async function saveAgent() {
     await loadAdminAgentData()
     await loadAgentPrompts(agentEditingId.value)
     void loadChatAgents(true)
-    agentSaved.value = prompt ? '已保存并发布新提示词版本（含上下文分段）' : '已保存（含上下文分段）'
+    agentSaved.value = '已保存 Agent 配置及上下文分段'
+    showSaveToast(agentSaved.value)
     orderDirty.value = false
     agPrompt.value = ''
     agPromptNote.value = ''
@@ -832,6 +858,9 @@ async function activateVersion(version: number) {
     await activateAgentPrompt(agentEditingId.value, version)
     await loadAdminAgentData()
     await loadAgentPrompts(agentEditingId.value)
+    const active = adminPrompts.value.find((p) => p.version === version)
+    agPrompt.value = active?.system_prompt ?? ''
+    agPromptNote.value = active?.note ?? ''
     void loadChatAgents(true)
     agentSaved.value = `已切换到 v${version}`
   } catch (e) {
@@ -1874,7 +1903,7 @@ async function onTest() {
                     <span v-if="systemPromptError" class="text-[11px] text-red-600">{{ systemPromptError }}</span>
                   </div>
                   <p class="mt-1 text-[10.5px] text-stone-400">
-                    生成时会按 Agent 预设里保存的上下文顺序追加分段标签；提示词留空时用默认基础提示词。保存会发布为新版本并自动启用。
+                    生成时会按 Agent 预设里保存的上下文顺序追加分段；提示词留空时只生成日期和分段。保存会发布为新版本并自动启用。
                   </p>
                 </div>
 
@@ -1940,40 +1969,28 @@ async function onTest() {
                         暂无记忆，点「+ 新增记忆」添加一条。
                       </p>
                       <div
-                        v-for="(memory, index) in memoryDrafts"
+                        v-for="memory in memoryDrafts"
                         :key="memory.id"
-                        class="mt-2 rounded-lg border border-stone-200 bg-white p-3"
+                        class="mt-2 flex items-center gap-2"
                       >
-                        <div class="flex items-center justify-between gap-2">
-                          <span class="text-[12px] font-medium text-stone-700">记忆 {{ index + 1 }}</span>
-                          <div class="flex items-center gap-2">
-                            <label class="flex items-center gap-1 text-[11px] text-stone-500">
-                              <input
-                                :checked="memory.enabled"
-                                @change="toggleMemoryEnabled(memory, ($event.target as HTMLInputElement).checked)"
-                                type="checkbox"
-                                class="h-3.5 w-3.5 accent-stone-800"
-                              />
-                              启用
-                            </label>
-                            <button
-                              type="button"
-                              @click="removeMemoryDraft(memory)"
-                              class="text-[11px] text-stone-400 hover:text-red-600"
-                            >
-                              删除
-                            </button>
-                          </div>
-                        </div>
-                        <textarea
+                        <input
+                          type="text"
                           :value="memory.content"
-                          @change="updateMemoryContent(memory, ($event.target as HTMLTextAreaElement).value)"
-                          rows="3"
+                          @change="updateMemoryContent(memory, ($event.target as HTMLInputElement).value)"
                           maxlength="20000"
                           placeholder="例如：用户偏好中文回答，先看结论再看依据。"
-                          class="mt-2 w-full resize-y rounded-lg border border-stone-200 px-2.5 py-2 text-[12px] leading-[1.6]"
+                          class="h-8 min-w-0 max-w-xl flex-1 rounded-lg border border-stone-200 px-2.5 text-[12px]"
                         />
-                        <p class="mt-1 text-[10.5px] text-stone-400">失焦后自动保存</p>
+                        <button
+                          type="button"
+                          @click="removeMemoryDraft(memory)"
+                          title="删除记忆"
+                          class="h-8 w-8 shrink-0 rounded-lg text-stone-400 hover:bg-red-50 hover:text-red-600 transition"
+                        >
+                          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 10v6M14 10v6" />
+                          </svg>
+                        </button>
                       </div>
                     </div>
 
@@ -2233,6 +2250,16 @@ async function onTest() {
             <p class="mt-1 text-[11.5px] leading-[1.5] text-stone-500">{{ preset.description }}</p>
           </button>
         </div>
+      </div>
+    </div>
+
+    <div
+      v-if="saveToast"
+      role="status"
+      class="pointer-events-none fixed inset-0 z-[80] flex items-center justify-center"
+    >
+      <div class="rounded-full bg-stone-800 px-5 py-2.5 text-[12.5px] text-white shadow-xl">
+        {{ saveToast }}
       </div>
     </div>
   </Teleport>

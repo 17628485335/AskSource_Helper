@@ -8,9 +8,9 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents import service as agent_service
-from app.chat.chat_manager import DEFAULT_SYSTEM_PROMPT, ChatConfigError, ChatManager
+from app.chat.chat_manager import ChatConfigError, ChatManager
 from app.graph import list_tool_specs
-from app.prompt import build_system_prompt
+from app.prompt import build_system_prompt, strip_legacy_default_prompt
 from auth.database import get_db
 from auth.deps import get_current_admin, get_current_user
 from auth.models import User
@@ -328,7 +328,7 @@ async def compose_system_prompt(
     不调用 build_context：这里直接从 binding 引用的 doc / 生成器 / memory 取内容，
     复用的是 build_system_prompt 的拼装规则。
     """
-    base = payload.prompt or DEFAULT_SYSTEM_PROMPT
+    base = strip_legacy_default_prompt(payload.prompt)
     tool_names = payload.tool_names
     all_tools = [spec.name for spec in list_tool_specs()]
     sections: list[tuple[str, str, str, str]] = []

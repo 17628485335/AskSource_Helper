@@ -7,7 +7,8 @@
 因为注册表空着也不会报错，模型只是少一个能力。
 """
 
+from . import current_datetime  # noqa: F401  导入即执行 @register_tool
 from . import read_url  # noqa: F401  导入即执行 @register_tool
 from . import web_search  # noqa: F401 导入即执行 @register_tool
 
-__all__ = ["read_url", "web_search"]
+__all__ = ["current_datetime", "read_url", "web_search"]

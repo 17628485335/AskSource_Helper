@@ -6,6 +6,8 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.prompt import compute_prompt_hash
+
 from .models import Agent, AgentPrompt
 from .schemas import AgentCreate, AgentOut, AgentPromptCreate, AgentPromptOut, AgentUpdate
 
@@ -34,6 +36,7 @@ class AgentContext:
     model: str
     thinking: bool
     tool_names: list[str] | None
+    prompt_hash: str = ""
 
 
 def _agent_out(agent: Agent) -> AgentOut:
@@ -59,6 +62,7 @@ def _prompt_out(prompt: AgentPrompt) -> AgentPromptOut:
         agent_id=prompt.agent_id,
         version=prompt.version,
         system_prompt=prompt.system_prompt,
+        prompt_hash=prompt.prompt_hash,
         note=prompt.note,
         created_at=prompt.created_at,
     )
@@ -107,6 +111,7 @@ async def create_agent(db: AsyncSession, payload: AgentCreate) -> AgentOut:
                     agent_id=agent.id,
                     version=1,
                     system_prompt=payload.system_prompt,
+                    prompt_hash=compute_prompt_hash(payload.system_prompt),
                     note="initial",
                 )
             )
@@ -182,6 +187,7 @@ async def create_prompt(
         agent_id=agent_id,
         version=int(max_version or 0) + 1,
         system_prompt=payload.system_prompt,
+        prompt_hash=compute_prompt_hash(payload.system_prompt),
         note=payload.note,
     )
     db.add(prompt)
@@ -233,6 +239,7 @@ async def resolve_agent(db: AsyncSession, agent_key: str) -> AgentContext:
         agent_key=agent.agent_key,
         prompt_version=prompt.version if prompt else None,
         system_prompt=prompt.system_prompt if prompt else None,
+        prompt_hash=prompt.prompt_hash if prompt else "",
         platform=agent.platform,
         model=agent.model,
         thinking=agent.thinking,

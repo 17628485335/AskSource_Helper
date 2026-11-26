@@ -369,14 +369,15 @@ def test_date_line_uses_beijing_wall_clock():
     )
 
 
-def test_compose_prompt_appends_date_and_only_mentions_citations_when_tools_exist():
+def test_compose_prompt_appends_date_without_tool_hints():
     assert compose_system_prompt("你好", now=datetime(2026, 1, 1, tzinfo=LOCAL_TZ)) == (
         "你好\n\n今天是 2026-01-01 周四（北京时间）。"
     )
-    hint = compose_system_prompt("你好", ["web_search", "read_url"])
-    assert "web_search / read_url" in hint and "[n]" in hint
-    # 没挂引用工具时不能让模型凭空写编号
-    assert "[n]" not in compose_system_prompt("你好", ["noop"])
+    # 工具不再触发额外的引用说明
+    assert compose_system_prompt("你好", ["web_search", "read_url"]) == (
+        compose_system_prompt("你好", ["noop"])
+    )
+    assert "[n]" not in compose_system_prompt("你好", ["web_search", "read_url"])
     # 传空串 = 本轮不带系统消息，不能被日期行救回去
     assert compose_system_prompt("", ["web_search"]) == ""
     assert compose_system_prompt("   \n", ["web_search"]) == ""

@@ -548,6 +548,8 @@ class ChatManager:
         self.default_key = default_key
         # 构建失败的行，只用于排查；对话报错时也会带出第一条
         self.errors = errors or []
+        # agent_key -> (prompt_hash, system_prompt)；每轮与库里 hash 对比，变了才刷新
+        self.prompt_cache: dict[str, tuple[str, str]] = {}
         # 整池共用的一份工具（建池时 load_tools 取一次）；每个 ModelAgent 的图都用它
         self.tools = list(tools) if tools is not None else []
         # 工具加载失败的那一句。单独存而不挤进 errors：那是代码问题，
