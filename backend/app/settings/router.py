@@ -3,6 +3,7 @@
 - /settings/model-providers：模型提供商下拉选项（静态）
 - /settings/models：对话时可选的模型列表（登录即可读，不含密钥）
 - /settings/llm：模型密钥配置的读写（仅管理员）
+- /settings/tools：当前真正挂进模型池的工具列表（登录即可读）
 
 llm_providers 不再是「每个用户一份」：/chat 解析配置时不按 user_id 过滤，
 所以这张表全库只有一份生效配置，写入端必须收紧到管理员，否则任何登录用户
@@ -20,6 +21,8 @@ from auth.database import get_db
 from auth.deps import get_current_admin, get_current_user
 from auth.models import User
 
+from app.graph import get_tool_spec
+
 from .llm import MODEL_PROVIDERS, ProviderOption, resolve_base_url, test_provider_connection
 from .models import LlmProvider
 from .schemas import (
@@ -28,6 +31,7 @@ from .schemas import (
     ProviderOut,
     ProviderTestRequest,
     ProviderTestResult,
+    ToolOut,
 )
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -55,6 +59,43 @@ async def list_model_providers() -> list[ProviderOption]:
         )
         for opt in MODEL_PROVIDERS
     ]
+
+
+@router.get(
+    "/tools",
+    response_model=list[ToolOut],
+    summary="当前支持的工具列表（登录即可读）",
+)
+async def list_current_tools(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[ToolOut]:
+    """返回真正挂进模型池的工具，而不是注册表里所有声明。
+
+    池在 build() 时已经过滤掉前置条件不满足的工具（如未配置密钥的搜索），
+    侧边栏据此展示「当前支持」；取不到池时返回空列表，把错误留给 /chat。
+    """
+    from app.chat import ChatManager
+
+    try:
+        pool = await ChatManager.get(db)
+    except Exception:
+        return []
+
+    result: list[ToolOut] = []
+    for tool in pool.tools:
+        name = getattr(tool, "name", "")
+        if not name:
+            continue
+        spec = get_tool_spec(name)
+        result.append(
+            ToolOut(
+                name=name,
+                label=spec.label if spec else name,
+                icon=spec.icon if spec else "",
+            )
+        )
+    return result
 
 
 @router.post(

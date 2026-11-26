@@ -1,6 +1,6 @@
 """Chat 路由：SSE 流式问答
 
-事件顺序：meta → token* → reasoning* → tool_start*/tool_end* → citations* → done；异常时产出 error 后结束。
+事件顺序：meta → (segment_start → token*/reasoning*/tool_start*/tool_end*/citations*)* → done；异常时产出 error 后结束。
 （事件语义与 astream_events 的映射表见 app/graph/stream_protocol.py；citations 是工具返回的结构化引用，
 一次工具调用可能多帧，前端按 index 去重累加。）
 上游静默超过 KEEPALIVE_IDLE 会插入 `: keepalive` 注释帧（客户端按规范忽略），
@@ -88,6 +88,7 @@ async def _event_stream(payload: ChatRequest, user_id: int) -> AsyncIterator[str
         thinking=payload.thinking,
         workspace_id=payload.workspace_id,
         regenerate=payload.regenerate,
+        agent_key=payload.agent_key,
     )
     async for event in events:
         yield _sse(event)

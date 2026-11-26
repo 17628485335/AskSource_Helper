@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import MarkdownRender from 'markstream-vue'
-import 'markstream-vue/index.css'
+import ChatMarkdown from './ChatMarkdown.vue'
+import SiteIcon from './SiteIcon.vue'
 import { useChat, type ChatMessage } from '../stores/chat'
 import { useUi } from '../stores/ui'
 import { useWorkspace } from '../stores/workspace'
 import { useAuth } from '../stores/auth'
 import { useModels } from '../stores/models'
-import type { ChatModelOption } from '../api/settings'
+import { useAgents } from '../stores/agents'
+import type { AgentDto, ChatModelOption } from '../api/settings'
 
 /* ---------------- 首页态热力图 Sessions / Credits（从 git 历史恢复） ---------------- */
 const heatTab = ref<'sessions' | 'credits'>('sessions')
@@ -86,6 +87,28 @@ const modelOpen = ref(false)
 const modelRef = ref<HTMLElement | null>(null)
 const { models: chatModels, usableModels, load: loadModels, clear: clearModels } = useModels()
 
+/* ---------------- Agent 选择 ---------------- */
+const agentOpen = ref(false)
+const agentRef = ref<HTMLElement | null>(null)
+const {
+  agents: chatAgents,
+  activeKey: pickedAgentKey,
+  activeAgent,
+  load: loadAgents,
+  clear: clearAgents,
+} = useAgents()
+
+type AgentOption = Pick<AgentDto, 'agent_key' | 'name'>
+
+function chooseAgent(agent: AgentOption) {
+  pickedAgentKey.value = agent.agent_key
+  agentOpen.value = false
+}
+
+function agentLabel(agent: AgentOption): string {
+  return agent.name?.trim() || agent.agent_key
+}
+
 /** 该行能不能真的对话：available 缺省算可用（兼容旧后端响应） */
 function isUsable(m: ChatModelOption): boolean {
   return m.available !== false
@@ -142,7 +165,18 @@ function toggleMic() {
 }
 
 /* ---------------- 对话（SSE 流式） ---------------- */
-const { messages, busy, hasConversation, modelLabel, startedAt, sessionId, send, stop } = useChat()
+const {
+  messages,
+  busy,
+  hasConversation,
+  modelLabel,
+  agentKey: activeAgentKey,
+  promptVersion,
+  startedAt,
+  sessionId,
+  send,
+  stop,
+} = useChat()
 /* 新会话默认归入当前选中的工作区 */
 const { activeId: workspaceId, activeWorkspace, loadSessions, sessions } = useWorkspace()
 /* 问候语用登录用户名，未登录时退化为通用文案；isLoggedIn 也驱动模型列表的加载与作废 */
@@ -165,6 +199,16 @@ const streamedLength = computed(() =>
   messages.value.reduce((n, m) => n + m.content.length + m.reasoning.length, 0),
 )
 watch(streamedLength, () => void scrollToBottom())
+
+/** 进入对话区（从首页切回 / 打开历史会话 / 首屏挂载）后，直接定位到最后一条消息 */
+function jumpToLatest() {
+  void scrollToBottom(true)
+}
+watch(stageView, (v) => {
+  if (v !== 'home') jumpToLatest()
+})
+watch(sessionId, () => jumpToLatest())
+onMounted(() => jumpToLatest())
 
 /** 当前选中的模型有没有深度档位（后端 /settings/models 的 supports_thinking） */
 const canThink = computed(() => pickedModel.value?.supports_thinking === true)
@@ -274,6 +318,7 @@ function submit() {
     workspace_id: workspaceId.value,
     platform: pickedModel.value?.platform,
     model: pickedModel.value?.model,
+    agent_key: pickedAgentKey.value,
   }).then(() =>
     // 本轮结束（含新建会话/首条消息生成标题）后刷新左侧栏会话列表
     loadSessions(),
@@ -291,6 +336,11 @@ function onKeydown(e: KeyboardEvent) {
 /* ---------------- 右侧对话详情面板 ---------------- */
 /** 详情栏折叠状态：默认折叠，左列占满，右栏收成窄轨 */
 const detailCollapsed = ref(true)
+/** 详情栏内容：chat=对话信息，sources=来源信息；入口不同显示不同内容 */
+type DetailMode = 'chat' | 'sources'
+const detailMode = ref<DetailMode>('chat')
+/** 来源栏当前对应哪条消息；null 表示整段会话 */
+const sourceMessageIndex = ref<number | null>(null)
 /** 后端会给会话生成标题（首条消息摘要），列表刷新前用本轮提问兜底 */
 const sessionTitle = ref('')
 // sessions 刷新（loadSessions）后同步真实标题
@@ -303,6 +353,8 @@ watch(sessionId, (v, old) => {
   // 展开态是按消息下记的，换会话后下标会指向另一条消息，直接作废
   reasoningToggled.value = {}
   reasoningFollow.value = {}
+  detailMode.value = 'chat'
+  sourceMessageIndex.value = null
   if (!v) {
     sessionTitle.value = ''
     return
@@ -311,7 +363,50 @@ watch(sessionId, (v, old) => {
   sessionTitle.value = found?.title || messages.value.find((m) => m.role === 'user')?.content.slice(0, 30) || ''
 })
 
-const usedTools = computed(() => [...new Set(messages.value.flatMap((m) => m.tools))])
+const usedTools = computed(() => [...new Set(messages.value.flatMap((m) => m.toolCalls.map((c) => c.name)))])
+/** 右侧「参考来源」：汇总本会话所有引用，按正文编号去重排序 */
+const allCitations = computed(() => {
+  const seen = new Set<number>()
+  const out: ChatMessage['citations'] = []
+  for (const m of messages.value) {
+    for (const c of m.citations) {
+      if (seen.has(c.index)) continue
+      seen.add(c.index)
+      out.push(c)
+    }
+  }
+  return out.sort((a, b) => a.index - b.index)
+})
+/** 来源栏显示的内容：跟随点开的那条消息；从右上角展开时才是整段会话 */
+const activeCitations = computed(() =>
+  sourceMessageIndex.value === null
+    ? allCitations.value
+    : (messages.value[sourceMessageIndex.value]?.citations ?? []),
+)
+/** 点正文里的 [n] 或「N篇来源」：来源栏已打开同一条消息则收起，否则展开该消息的来源 */
+function toggleSources(messageIndex?: number) {
+  if (
+    !detailCollapsed.value
+    && detailMode.value === 'sources'
+    && sourceMessageIndex.value === (messageIndex ?? null)
+  ) {
+    detailCollapsed.value = true
+    return
+  }
+  sourceMessageIndex.value = messageIndex ?? null
+  detailCollapsed.value = false
+  detailMode.value = 'sources'
+}
+/** 点正文 [n] 时沿用所在消息的来源列表 */
+function citeFromMessage(messageIndex: number) {
+  toggleSources(messageIndex)
+}
+/** 点右侧窄轨的展开按钮：只显示对话信息 */
+function openChatDetails() {
+  sourceMessageIndex.value = null
+  detailCollapsed.value = false
+  detailMode.value = 'chat'
+}
 const lastError = computed(() => [...messages.value].reverse().find((m) => m.error)?.error || '')
 const lastActivity = computed(() => {
   const done = messages.value.filter((m) => m.role === 'assistant' && m.content)
@@ -335,9 +430,34 @@ function sourceDomain(url: string): string {
   }
 }
 
+/** 按钮里最多展示 3 个不同站点的图标，同一域名只占一个位置 */
+function buttonSources(citations: ChatMessage['citations']) {
+  const seen = new Set<string>()
+  return citations.filter((c) => {
+    const domain = sourceDomain(c.url)
+    if (!domain || seen.has(domain)) return false
+    seen.add(domain)
+    return true
+  }).slice(0, 3)
+}
+
 /** 只放行 http(s)：url 是外部搜索接口返的，进 href 就能让 javascript: 变成 XSS 入口 */
 function safeSourceUrl(url: string): string {
   return /^https?:\/\//i.test(url) ? url : ''
+}
+
+/** 模型偶尔会在正文末尾自己列「参考来源：[n]…」，与下方按钮重复；展示时去掉这一段 */
+function displayContent(content: string): string {
+  for (const label of ['参考来源', '采用的来源']) {
+    const idx = content.lastIndexOf(label)
+    if (idx < 0) continue
+    const tail = content.slice(idx)
+    // 尾部只剩标题 + [n] 编号（含流式未写完的半个编号）才当来源段裁掉，避免误伤正文
+    if (new RegExp(`^${label}\\*{0,2}\\s*[：:][\\s\\[\\]\\d]*$`, 'u').test(tail)) {
+      return content.slice(0, idx).replace(/\*+\s*$/, '').trimEnd()
+    }
+  }
+  return content.trimEnd()
 }
 
 /** 我方消息的行内编辑与复制 */
@@ -371,6 +491,7 @@ function saveEdit() {
     workspace_id: workspaceId.value,
     platform: pickedModel.value?.platform,
     model: pickedModel.value?.model,
+    agent_key: pickedAgentKey.value,
     regenerate: true,
   }).then(() => loadSessions())
   void scrollToBottom(true)
@@ -391,18 +512,25 @@ function closeDropdownsOnOutside(e: MouseEvent) {
   if (approveRef.value && !approveRef.value.contains(e.target as Node)) approveOpen.value = false
   if (autoRef.value && !autoRef.value.contains(e.target as Node)) autoOpen.value = false
   if (modelRef.value && !modelRef.value.contains(e.target as Node)) modelOpen.value = false
+  if (agentRef.value && !agentRef.value.contains(e.target as Node)) agentOpen.value = false
 }
 onMounted(() => {
   document.addEventListener('mousedown', closeDropdownsOnOutside)
-  // 模型列表要登录才能读：已登录（刷新页面后 restoreSession 完成）就直接拉一次
-  if (isLoggedIn.value) void loadModels()
+  // 模型与 agent 列表都要登录才能读：已登录（刷新页面后 restoreSession 完成）就直接拉一次
+  if (isLoggedIn.value) {
+    void loadModels()
+    void loadAgents()
+  }
 })
-// 登录后刷新可选模型，登出作废缓存与选中项，避免下一个账号看到上一个的列表
+// 登录后刷新可选配置，登出作废缓存与选中项，避免下一个账号看到上一个的列表
 watch(isLoggedIn, (v) => {
-  if (v) void loadModels(true)
-  else {
+  if (v) {
+    void loadModels(true)
+    void loadAgents(true)
+  } else {
     clearModels()
     pickedModel.value = null
+    clearAgents()
   }
 })
 onBeforeUnmount(() => {
@@ -535,20 +663,20 @@ onBeforeUnmount(() => {
 
             <!-- 助手消息 -->
             <div v-else class="group max-w-[92%] min-w-0">
-              <div v-if="m.tools.length" class="mb-2.5 flex flex-wrap gap-2">
+              <div v-if="m.toolCalls.length" class="mb-2.5 flex flex-wrap gap-2">
                 <span
-                  v-for="t in m.tools"
-                  :key="t"
+                  v-for="tc in m.toolCalls"
+                  :key="tc.callId || tc.name"
                   class="inline-flex items-center gap-1.5 rounded-full border border-stone-200 bg-stone-50 px-2.5 py-1 text-[11.5px] text-stone-600"
-                  :title="m.toolStates[t] === 'running' ? '执行中…' : undefined"
+                  :title="tc.state === 'running' ? '执行中…' : undefined"
                 >
-                  <!-- 协议 v2 的 tool_start/tool_end：running 转圈，done 打勾；历史恢复无状态时保持静态钩子图 -->
+                  <!-- 协议 v2 的 tool_start/tool_end（按 call_id 跟踪）：running 转圈，done 打勾 -->
                   <span
-                    v-if="m.toolStates[t] === 'running'"
+                    v-if="tc.state === 'running'"
                     class="h-3 w-3 shrink-0 animate-spin rounded-full border-[1.5px] border-stone-300 border-t-stone-600"
                   ></span>
                   <svg
-                    v-else-if="m.toolStates[t] === 'done'"
+                    v-else-if="tc.state === 'done'"
                     width="13"
                     height="13"
                     viewBox="0 0 24 24"
@@ -564,7 +692,7 @@ onBeforeUnmount(() => {
                   <svg v-else width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4z" />
                   </svg>
-                  调用 {{ t }}
+                  调用 {{ tc.name }}
                 </span>
               </div>
 
@@ -602,52 +730,15 @@ onBeforeUnmount(() => {
                 >{{ m.reasoning }}</p>
               </div>
 
-              <!-- 正文：流式 Markdown 渲染（markstream 对未闭合语法做了稳定部分渲染） -->
-              <MarkdownRender
-                v-if="m.content"
-                mode="chat"
-                :content="m.content"
+              <!-- 正文：自定义排版 + [n] 引用徽标 + 代码块复制 -->
+              <ChatMarkdown
+                v-if="displayContent(m.content)"
+                :content="displayContent(m.content)"
                 :final="!m.streaming"
-                :is-dark="false"
-                class="md-answer px-1 py-0.5 text-[13.5px] leading-[1.7] text-stone-700"
+                class="px-1 py-0.5"
+                @cite="citeFromMessage(i)"
               />
               <div v-else-if="!m.streaming && !m.error" class="px-1 py-0.5 text-[13.5px] text-stone-400">（无内容）</div>
-
-              <!-- 参考来源：工具 artifact 下发，编号与正文里的 [n] 同号；后端不落库，重进会话时为空 -->
-              <div v-if="m.citations.length" class="mt-3 rounded-xl border border-stone-200/80 bg-stone-50/70 px-3 py-2.5">
-                <div class="flex items-center gap-1.5 text-[11.5px] text-stone-500">
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M4 4h6a2 2 0 0 1 2 2v13a1.5 1.5 0 0 0-1.5-1.5H4Z" />
-                    <path d="M20 4h-5a2 2 0 0 0-2 2v13a1.5 1.5 0 0 1 1.5-1.5H20Z" />
-                  </svg>
-                  参考来源 · {{ m.citations.length }}
-                  <span v-if="m.streaming" class="text-stone-400">仍在检索…</span>
-                </div>
-                <ul class="mt-1.5 space-y-0.5">
-                  <li v-for="c in m.citations" :key="c.index">
-                    <a
-                      v-if="safeSourceUrl(c.url)"
-                      :href="c.url"
-                      target="_blank"
-                      rel="noopener noreferrer nofollow"
-                      :title="c.url"
-                      class="-mx-1.5 block rounded-lg px-1.5 py-1 transition hover:bg-white"
-                    >
-                      <span class="flex items-baseline gap-1.5">
-                        <span class="shrink-0 rounded-full border border-stone-200 bg-white px-1 text-[10.5px] leading-4 text-stone-500">{{ c.index }}</span>
-                        <span class="min-w-0 truncate text-[12.5px] text-stone-700">{{ c.title || sourceDomain(c.url) || c.url }}</span>
-                        <span v-if="c.kind === 'page'" class="shrink-0 text-[10.5px] text-stone-400">已读原文</span>
-                      </span>
-                      <p v-if="c.snippet" class="mt-0.5 line-clamp-2 pl-[27px] text-[11.5px] leading-[1.6] text-stone-500">{{ c.snippet }}</p>
-                      <p class="mt-0.5 truncate pl-[27px] text-[11px] text-stone-400">
-                        {{ sourceDomain(c.url) }}<span v-if="c.published_date"> · {{ c.published_date }}</span>
-                      </p>
-                    </a>
-                    <!-- 地址不是 http(s)：只当文字展示，不给可点的链接 -->
-                    <span v-else class="-mx-1.5 block truncate px-1.5 py-1 text-[12px] text-stone-500">{{ c.title || c.url }}</span>
-                  </li>
-                </ul>
-              </div>
 
               <p v-if="m.error" class="mt-2 text-[12.5px] text-red-500">{{ m.error }}</p>
               <p v-else-if="m.streaming && !m.content && !m.reasoning" class="mt-2 text-[12.5px] text-stone-400">
@@ -656,7 +747,33 @@ onBeforeUnmount(() => {
                   m.thinking ? '（深度思考模式首字较慢，仍在生成）' : '（本轮是快速档，慢在上游排队）'
                 }}</span><span class="dots"></span>
               </p>
+              <!-- 参考来源：放在时间戳上方，点击到右侧详情栏展开完整列表 -->
+              <div v-if="m.citations.length" class="mt-2 px-1">
+                <button
+                  type="button"
+                  @click="toggleSources(i)"
+                  class="inline-flex items-center gap-1.5 rounded-full border border-stone-200 bg-stone-50 px-2.5 py-1 text-[11.5px] text-stone-600 transition hover:bg-stone-100 hover:text-stone-800"
+                  :title="!detailCollapsed && detailMode === 'sources' ? '收起右侧来源栏' : '在右侧展开来源'"
+                >
+                  <span class="flex -space-x-1.5">
+                    <SiteIcon
+                      v-for="c in buttonSources(m.citations)"
+                      :key="c.index"
+                      :url="c.url"
+                      :size="16"
+                      class="border border-white"
+                    />
+                  </span>
+                  {{ m.citations.length }}篇来源
+                  <span v-if="m.streaming" class="text-stone-400">仍在检索…</span>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="m9 18 6-6-6-6" />
+                  </svg>
+                </button>
+              </div>
+
               <p v-if="(m.content || m.error) && m.created_at" class="mt-1.5 px-1 text-[11px] text-stone-400 opacity-0 transition group-hover:opacity-100">{{ formatMsgTime(m.created_at) }}</p>
+
             </div>
           </div>
         </div>
@@ -867,8 +984,46 @@ onBeforeUnmount(() => {
               </div>
             </div>
 
-            <!-- 右侧：模型 / Auto / 麦克风 / 发送 -->
+            <!-- 右侧：Agent / 模型 / Auto / 麦克风 / 发送 -->
             <div class="flex items-center gap-1.5">
+              <!-- Agent：默认 chat，管理员新增后立刻可选 -->
+              <div ref="agentRef" class="relative">
+                <button
+                  type="button"
+                  @click="agentOpen = !agentOpen"
+                  class="h-9 px-3 inline-flex items-center gap-1.5 rounded-lg text-[12px] text-stone-600 hover:bg-stone-100 transition"
+                  title="选择 Agent"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="opacity-70" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="4" y="8" width="16" height="12" rx="2" />
+                    <path d="M12 8V4M8 14h.01M16 14h.01M9 18h6" />
+                  </svg>
+                  {{ activeAgent ? agentLabel(activeAgent) : (pickedAgentKey || '默认 Agent') }}
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="text-stone-400" stroke-linecap="round">
+                    <path d="m6 9 6 6 6-6" />
+                  </svg>
+                </button>
+                <div
+                  v-if="agentOpen"
+                  class="absolute right-0 bottom-10 z-30 w-56 max-h-72 overflow-y-auto scroll-thin rounded-xl bg-white border border-stone-200 shadow-lg shadow-stone-900/5 p-1.5"
+                >
+                  <button
+                    v-for="a in chatAgents"
+                    :key="a.id"
+                    type="button"
+                    @click="chooseAgent(a)"
+                    class="w-full text-left px-3 py-2 rounded-lg text-[12.5px] transition"
+                    :class="pickedAgentKey === a.agent_key ? 'bg-stone-100 text-stone-900 font-medium' : 'text-stone-600 hover:bg-stone-100'"
+                  >
+                    <span class="block truncate">{{ agentLabel(a) }}</span>
+                    <span class="block truncate text-[11px] text-stone-400">{{ a.agent_key }} · v{{ a.active_prompt_version }}</span>
+                  </button>
+                  <p v-if="!chatAgents.length" class="px-3 py-2 text-[12px] text-stone-400">
+                    管理员还没配置 Agent，发送时走默认 chat
+                  </p>
+                </div>
+              </div>
+
               <!-- 模型：只列管理员接入的（不含密钥），平铺不标平台 -->
               <div ref="modelRef" class="relative">
                 <button
@@ -1017,13 +1172,13 @@ onBeforeUnmount(() => {
     <aside
       v-if="hasConversation"
       class="shrink-0 flex flex-col border-l border-stone-200 bg-stone-50/60 transition-[width] duration-300 ease-out"
-      :class="detailCollapsed ? 'w-11 py-4 items-center' : 'w-1/4 overflow-y-auto scroll-thin px-5 py-6'"
+      :class="detailCollapsed ? 'w-11 py-4 items-center' : detailMode === 'sources' ? 'w-1/4 overflow-y-auto scroll-thin px-5 py-3' : 'w-1/4 overflow-y-auto scroll-thin px-5 py-6'"
     >
       <!-- 折叠态：仅一个展开按钮的窄轨 -->
       <button
         v-if="detailCollapsed"
         type="button"
-        @click="detailCollapsed = false"
+        @click="openChatDetails"
         class="h-8 w-8 shrink-0 grid place-items-center rounded-lg text-stone-500 hover:bg-stone-200/70 hover:text-stone-700 transition"
         title="展开对话详情"
       >
@@ -1032,7 +1187,7 @@ onBeforeUnmount(() => {
 
       <!-- 展开态 -->
       <template v-else>
-        <div class="flex items-center justify-between">
+        <div v-if="detailMode === 'chat'" class="flex items-center justify-between">
           <h2 class="text-[11px] font-medium tracking-[0.12em] uppercase text-stone-400">对话详情</h2>
           <button
             type="button"
@@ -1043,7 +1198,7 @@ onBeforeUnmount(() => {
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg>
           </button>
         </div>
-      <div class="mt-5 space-y-5">
+      <div v-if="detailMode === 'chat'" class="mt-5 space-y-5">
         <div>
           <p class="text-[10.5px] text-stone-400 mb-1">标题</p>
           <p class="text-[13px] font-medium text-stone-800 leading-snug break-words">
@@ -1053,6 +1208,13 @@ onBeforeUnmount(() => {
         <div>
           <p class="text-[10.5px] text-stone-400 mb-1">模型</p>
           <p class="text-[12.5px] text-stone-700 break-words">{{ modelLabel || '—' }}</p>
+        </div>
+        <div>
+          <p class="text-[10.5px] text-stone-400 mb-1">Agent</p>
+          <p class="text-[12.5px] text-stone-700 break-words">
+            {{ activeAgentKey || '默认 chat' }}
+            <span v-if="promptVersion" class="text-stone-400">· 提示词 v{{ promptVersion }}</span>
+          </p>
         </div>
         <div>
           <p class="text-[10.5px] text-stone-400 mb-1">工作区</p>
@@ -1089,6 +1251,58 @@ onBeforeUnmount(() => {
           <p class="text-[11.5px] leading-relaxed break-words text-red-500">{{ lastError }}</p>
         </div>
       </div>
+
+      <!-- 来源模式：只显示来源列表，不带对话信息 -->
+      <div v-else>
+        <div class="mb-2 flex items-center gap-2">
+          <p class="text-[13px] font-semibold text-stone-700">参考来源</p>
+          <span class="rounded-full bg-stone-200/70 px-2 text-[11px] leading-5 text-stone-500">{{ activeCitations.length }}</span>
+          <button
+            type="button"
+            @click="detailCollapsed = true"
+            class="ml-auto h-7 w-7 grid place-items-center rounded-lg text-stone-400 hover:bg-stone-200/70 hover:text-stone-600 transition"
+            title="折叠来源列表"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg>
+          </button>
+        </div>
+        <ul v-if="activeCitations.length" class="max-h-[calc(100vh-6rem)] space-y-2.5 overflow-y-auto scroll-thin pr-1">
+          <li v-for="c in activeCitations" :key="c.index">
+            <a
+              v-if="safeSourceUrl(c.url)"
+              :href="c.url"
+              target="_blank"
+              rel="noopener noreferrer nofollow"
+              :title="c.url"
+              class="block rounded-xl border border-stone-200/80 bg-white p-3 transition hover:border-stone-300 hover:shadow-sm"
+            >
+              <span class="flex items-start gap-2.5">
+                <SiteIcon :url="c.url" :size="20" class="mt-0.5 ring-1 ring-stone-200" />
+                <span class="min-w-0 flex-1">
+                  <span class="flex items-start justify-between gap-2">
+                    <span class="line-clamp-2 text-[12.5px] font-medium leading-[1.5] text-stone-800">
+                      {{ c.title || sourceDomain(c.url) || c.url }}
+                    </span>
+                    <span class="shrink-0 rounded-md bg-stone-100 px-1.5 text-[10px] leading-5 text-stone-500">{{ c.index }}</span>
+                  </span>
+                  <span v-if="c.snippet" class="mt-1.5 block line-clamp-2 text-[11px] leading-[1.6] text-stone-500">{{ c.snippet }}</span>
+                  <span class="mt-1.5 flex items-center gap-1.5 text-[10.5px] text-stone-400">
+                    <span class="min-w-0 truncate">{{ sourceDomain(c.url) }}</span>
+                    <span v-if="c.published_date" class="shrink-0">· {{ c.published_date }}</span>
+                    <span v-if="c.kind === 'page'" class="ml-auto shrink-0 rounded bg-emerald-50 px-1 text-emerald-600">已读</span>
+                  </span>
+                </span>
+              </span>
+            </a>
+            <span v-else class="block rounded-xl border border-stone-200/80 bg-white p-3 text-[11.5px] text-stone-500">
+              {{ c.index }}. {{ c.title || c.url }}
+            </span>
+          </li>
+        </ul>
+        <div v-else class="rounded-xl border border-dashed border-stone-200 px-3 py-8 text-center text-[12px] text-stone-400">
+          本轮还没有参考来源
+        </div>
+      </div>
       </template>
     </aside>
 
@@ -1118,39 +1332,5 @@ onBeforeUnmount(() => {
   50% {
     opacity: 1;
   }
-}
-
-/* Markdown 正文微调：字号放大后同步松开块级间距，首尾元素不留多余外边距 */
-.md-answer :deep(p) {
-  margin: 0.6em 0;
-}
-.md-answer :deep(ul),
-.md-answer :deep(ol) {
-  margin: 0.6em 0;
-  padding-left: 1.5em;
-}
-.md-answer :deep(li) {
-  margin: 0.25em 0;
-}
-.md-answer :deep(h1),
-.md-answer :deep(h2),
-.md-answer :deep(h3),
-.md-answer :deep(h4) {
-  margin: 0.75em 0 0.4em;
-  font-weight: 600;
-  line-height: 1.35;
-}
-.md-answer :deep(pre) {
-  margin: 0.65em 0;
-  font-size: 14px;
-}
-.md-answer :deep(code) {
-  font-size: 0.9em;
-}
-.md-answer :deep(:first-child) {
-  margin-top: 0;
-}
-.md-answer :deep(:last-child) {
-  margin-bottom: 0;
 }
 </style>

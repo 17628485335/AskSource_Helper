@@ -21,6 +21,24 @@ export interface SessionDto {
   updated_at: string
 }
 
+/** 与后端 ToolCallOut 对齐 */
+export interface ToolCallDto {
+  id: number
+  session_id: number
+  message_id: number
+  seq: number
+  tool_name: string
+  call_id: string
+  created_at: string
+  turn_id?: number | null
+  segment_id?: number | null
+  input_json?: Record<string, unknown> | null
+  result_text?: string
+  preview?: string
+  duration_ms?: number | null
+  citations_json?: Array<Record<string, unknown>> | null
+}
+
 /** 与后端 MessageOut 对齐（role 含 user/assistant/system/tools） */
 export interface SessionMessageDto {
   id: number
@@ -30,6 +48,8 @@ export interface SessionMessageDto {
   tool_name: string
   tokens: number
   created_at: string
+  turn_id?: number | null
+  tool_calls?: ToolCallDto[]
 }
 
 export interface SessionPageDto {

@@ -2,6 +2,7 @@
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import AuthDialog from './AuthDialog.vue'
 import SettingsDialog from './SettingsDialog.vue'
+import { listTools, type ToolDto } from '../api/settings'
 import { useAuth } from '../stores/auth'
 import { useChat } from '../stores/chat'
 import { useLlm } from '../stores/llm'
@@ -144,9 +145,9 @@ const navItems = [
 /** 底部菜单 */
 const bottomItems = [
   {
-    key: 'sites',
-    label: '站点',
-    icon: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18ZM3.6 9h16.8M3.6 15h16.8M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18Z',
+    key: 'tools',
+    label: '工具',
+    icon: 'M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9l-3.8 3.8Z',
   },
   {
     key: 'automations',
@@ -167,6 +168,93 @@ const bottomItems = [
 ]
 
 const activeNav = ref('new-task')
+
+/** 底部「工具」悬停面板：首次悬停才拉接口，后端按当前已挂载的工具返回 */
+const supportedTools = ref<ToolDto[]>([])
+const toolsLoaded = ref(false)
+const toolsLoading = ref(false)
+const toolsOpen = ref(false)
+const toolsPos = ref({ top: 0, left: 0 })
+let toolsCloseTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 后端给的是 lucide 图标名，这里内联对应 path，按需扩展即可 */
+const LUCIDE_PATHS: Record<string, string[]> = {
+  globe: [
+    'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z',
+    'M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20',
+    'M2 12h20',
+  ],
+  'file-text': [
+    'M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z',
+    'M14 2v5h6',
+    'M10 9H8',
+    'M16 13H8',
+    'M16 17H8',
+  ],
+  wrench: [
+    'M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9l-3.8 3.8Z',
+  ],
+}
+
+function toolIconPaths(icon: string): string[] {
+  return LUCIDE_PATHS[icon] ?? LUCIDE_PATHS.wrench
+}
+
+async function loadSupportedTools(): Promise<void> {
+  if (toolsLoaded.value || toolsLoading.value) return
+  toolsLoading.value = true
+  try {
+    supportedTools.value = await listTools()
+    toolsLoaded.value = true
+  } catch {
+    supportedTools.value = []
+    toolsLoaded.value = false // 允许下次悬停重试，不把一次网络抖动固化成「暂无工具」
+  } finally {
+    toolsLoading.value = false
+  }
+}
+
+function openToolsPanel(e: MouseEvent): void {
+  if (toolsCloseTimer) {
+    clearTimeout(toolsCloseTimer)
+    toolsCloseTimer = null
+  }
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  const panelWidth = 192
+  const left = rect.right + 10 + panelWidth > window.innerWidth
+    ? Math.max(8, rect.left - panelWidth - 10)
+    : rect.right + 10
+  toolsPos.value = { top: Math.max(8, Math.min(rect.top, window.innerHeight - 200)), left }
+  toolsOpen.value = true
+  void loadSupportedTools()
+}
+
+function closeToolsSoon(): void {
+  if (toolsCloseTimer) clearTimeout(toolsCloseTimer)
+  toolsCloseTimer = setTimeout(() => {
+    toolsOpen.value = false
+    toolsCloseTimer = null
+  }, 120)
+}
+
+function cancelCloseTools(): void {
+  if (toolsCloseTimer) {
+    clearTimeout(toolsCloseTimer)
+    toolsCloseTimer = null
+  }
+}
+
+onBeforeUnmount(() => {
+  if (toolsCloseTimer) clearTimeout(toolsCloseTimer)
+})
+
+function onBottomEnter(item: { key: string }, e: MouseEvent): void {
+  if (item.key === 'tools') openToolsPanel(e)
+}
+
+function onBottomLeave(item: { key: string }): void {
+  if (item.key === 'tools') closeToolsSoon()
+}
 
 /** 主导航点击：新对话清空当前聊天回到空白画布，其余项暂只切换高亮 */
 function onNavClick(key: string) {
@@ -494,7 +582,9 @@ watch(isLoggedIn, (v) => {
             type="button"
             class="w-full flex items-center rounded-lg text-[12.5px] text-[#4b4938] hover:bg-white/50 transition"
             :class="collapsed ? 'justify-center h-8' : 'gap-2.5 px-3 py-2'"
-            :title="item.label"
+            :title="item.key === 'tools' ? '当前支持的工具' : item.label"
+            @mouseenter="onBottomEnter(item, $event)"
+            @mouseleave="onBottomLeave(item)"
           >
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 opacity-70">
               <path :d="item.icon" />
@@ -593,5 +683,37 @@ watch(isLoggedIn, (v) => {
 
     <!-- 设置弹窗（LLM 配置） -->
     <SettingsDialog v-model="settingsOpen" />
+
+    <!-- 工具列表 Teleport 到 body：侧边栏自身 overflow-hidden，浮层放里面会被裁掉 -->
+    <Teleport to="body">
+      <div
+        v-if="toolsOpen"
+        role="tooltip"
+        class="fixed z-[100] max-h-[70vh] w-48 overflow-y-auto rounded-xl border border-[#E6E0CC] bg-white p-2.5 shadow-[0_12px_36px_rgba(45,42,30,0.16)]"
+        :style="{ top: `${toolsPos.top}px`, left: `${toolsPos.left}px` }"
+        @mouseenter="cancelCloseTools"
+        @mouseleave="toolsOpen = false"
+      >
+        <p class="mb-1.5 px-1 text-[11.5px] font-semibold text-[#3f3d30]">当前支持的工具</p>
+        <p v-if="toolsLoading && !supportedTools.length" class="px-1 py-2 text-[11px] text-[#8a8872]">
+          加载中…
+        </p>
+        <p v-else-if="!supportedTools.length" class="px-1 py-2 text-[11px] text-[#8a8872]">
+          暂无可用工具
+        </p>
+        <ul v-else class="space-y-0.5">
+          <li
+            v-for="tool in supportedTools"
+            :key="tool.name"
+            class="flex items-center gap-2 rounded-lg px-2 py-1.5 text-[11.5px] text-[#4b4938] hover:bg-[#F7F3E9]"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 opacity-70">
+              <path v-for="d in toolIconPaths(tool.icon)" :key="d" :d="d" />
+            </svg>
+            <span class="truncate">{{ tool.label || tool.name }}</span>
+          </li>
+        </ul>
+      </div>
+    </Teleport>
   </aside>
 </template>

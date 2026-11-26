@@ -13,7 +13,7 @@ from typing import Any, Sequence
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import ChatMessage, ChatSession
+from .models import ChatMessage, ChatSession, ChatToolCall
 
 # 默认只带最近若干轮进 prompt，避免上下文超长
 DEFAULT_HISTORY_LIMIT = 20
@@ -132,11 +132,13 @@ async def append_message(
     role: str,
     content: str,
     tool_name: str = "",
+    tool_calls: list[dict[str, Any]] | None = None,
+    turn_id: int | None = None,
     tokens: int = 0,
 ) -> ChatMessage | None:
-    """往会话追加一条消息，并同步维护计数 / 标题 / 活跃时间。
+    """往会话追加一条消息及其工具调用，并同步维护计数 / 标题 / 活跃时间。
 
-    会话不存在或不属于该用户返回 None（调用方决定是 404 还是忽略）。
+    工具调用与消息在同一事务落库；会话不存在或不属于该用户返回 None。
     """
     session = await get_session(db, session_id, user_id)
     if session is None:
@@ -147,10 +149,33 @@ async def append_message(
         session_id=session.id,
         role=role,
         content=text,
+        turn_id=turn_id,
         tool_name=tool_name,
         tokens=tokens,
     )
     db.add(message)
+    await db.flush()  # 先拿到 message.id，工具行才能带上外键
+    # user 行就是一轮的锚点，turn_id 回填为自己；assistant / 工具行由调用方传入同一个 id
+    if role == "user" and turn_id is None:
+        message.turn_id = message.id
+
+    for call in tool_calls or []:
+        db.add(
+            ChatToolCall(
+                session_id=session.id,
+                message_id=message.id,
+                turn_id=turn_id,
+                seq=call.get("seq", 0),
+                segment_id=call.get("segment_id"),
+                tool_name=call.get("tool_name", ""),
+                call_id=call.get("call_id", ""),
+                input_json=call.get("input") or {},
+                result_text=call.get("result") or "",
+                preview=call.get("preview") or "",
+                duration_ms=call.get("duration_ms"),
+                citations_json=call.get("citations") or [],
+            )
+        )
 
     # 首条用户消息充当会话标题，省去前端另外起名
     if role == "user" and not session.title:
@@ -185,6 +210,20 @@ async def load_messages(
         .limit(max(1, limit))
     )
     return list(reversed(rows.all()))  # 取最新 N 条后转回时间正序
+
+
+async def load_tool_calls(
+    db: AsyncSession, message_ids: Sequence[int]
+) -> list[ChatToolCall]:
+    """按消息 id 批量取工具调用，按本轮 seq 排序，供 /messages 响应附带"""
+    if not message_ids:
+        return []
+    rows = await db.scalars(
+        select(ChatToolCall)
+        .where(ChatToolCall.message_id.in_(message_ids))
+        .order_by(ChatToolCall.seq.asc(), ChatToolCall.id.asc())
+    )
+    return list(rows.all())
 
 
 async def count_messages(db: AsyncSession, session_id: int) -> int:

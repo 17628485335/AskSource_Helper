@@ -14,8 +14,8 @@
   前端就只剩干等，看起来和快速档一模一样。
 - 工具的返回值（ToolMessage）既不是助手的话也不是正文，必须单独接住：
   不接的话正文提取会把整段搜索结果当成 token 发给前端并落库。
-  新协议下这件事由 graph.stream_protocol.translate 完成：它只从 on_chat_model_stream
-  取正文，工具结果从 on_tool_end 的 ToolMessage.artifact 取引用，以 citations 事件下发，同样不落库。
+  stream() 只从 on_chat_model_stream 取正文；工具结果从 on_tool_end 取出，
+  截断版作 preview 推前端、完整版作 result 交给 service 按 segment 落库。
 - /settings/models 同时用 has() 标出该行是否真的建进了池（available）：列表读表、
   能不能聊取决于池，一行构建失败时它仍留在表里，不标注就会让前端选到一个必报错的模型。
 - 构建时机只有两个：启动 lifespan 预热，以及管理员保存配置后 reload。因此不再有按
@@ -41,8 +41,8 @@
   一个坏工具拖垮整池；池级加载只会退化成「所有模型都不带工具」的纯对话。
 - 具体工具写在 app/tools/（一个工具一个文件，按功能命名不带 _tool 后缀），
   导入该包即完成注册（见上方 import app.tools）；注册表在 app/graph/tools.py。
-- 分层：ModelAgent 只管模型态与「问模型」——stream() 把图交给 graph.stream_protocol
-  翻译成 token/reasoning/tool_start/tool_end/citations；
+- 分层：ModelAgent 只管模型态与「问模型」——  stream() 直接消费 astream_events(v2)，
+  用 graph.stream_protocol 的 ev_* 工厂产出 segment_start/token/reasoning/tool_start/tool_end/citations；
   会话归属、消息落库、取历史、meta/done/error 编排全部在 service.stream_chat()。
   那边分三段各自开关数据库会话（一次流式回答可能挂数十秒，全程持有请求级 db 会话
   会长时间占用连接池连接，并发稍高就耗尽。实测 FastAPI 注入的 db 在流式期间仍存活，
@@ -51,27 +51,38 @@
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # 导入 app.tools 这个包 = 注册全部内置工具（各模块的 @register_tool 在导入期执行）。
 # 只调 get_tools() 不会触发注册，漏掉这行的症状是「工具默默消失了」且不报错。
 import app.tools  # noqa: F401
-from app.graph import get_tools, stream_protocol, tool_is_available
+from app.graph import get_tool_spec, get_tools, tool_is_available
+from app.graph.stream_protocol import (
+    ev_citations,
+    ev_reasoning,
+    ev_segment_start,
+    ev_token,
+    ev_tool_end,
+    ev_tool_start,
+)
 from app.settings.llm import build_model, get_llm_settings
 from app.settings.models import LlmProvider
+from app.tools.citations import extract_citations
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是 AskSource 助手。回答要简洁、直接；"
     "需要外部信息或执行操作时优先调用已提供的工具，不要编造结果。"
+    "引用只在正文里用 [n] 标注，不要在末尾另列“参考来源”清单，界面会单独展示。"
 )
 
 # 提示词里的「今天」按北京墙钟算：容器与 MySQL 默认常年 UTC（本项目已踩过一次
@@ -80,6 +91,96 @@ LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 _WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 # 会产出引用编号的工具：只有它们在场才提 [n] 约定，否则模型会在回答里凭空写编号
 CITATION_TOOLS = frozenset({"web_search", "read_url"})
+
+# tool_end.preview 的截断长度：够前端 tooltip/展开区用，又不会把整页搜索原文推过网络
+PREVIEW_CHARS = 400
+
+
+def _text_of(content: Any) -> str:
+    """消息 content 容错取值：str 或分块 list（推理模型的多模态形状）"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text") or "")
+        return "".join(parts)
+    return ""
+
+
+def _result_of(output: Any) -> str:
+    """工具完整结果：ToolMessage 取 content，dict 取字符串化，其余 str 兜底"""
+    if isinstance(output, ToolMessage):
+        text = _text_of(output.content)
+    elif isinstance(output, dict):
+        text = next(
+            (_text_of(v.content) for v in output.values() if isinstance(v, ToolMessage)),
+            str(output),
+        )
+    else:
+        text = str(output)
+    return text.strip()
+
+
+def _preview_of(output: Any) -> str:
+    """工具结果的展示摘要：完整结果截到 PREVIEW_CHARS，供前端 tooltip/展开区用"""
+    return _result_of(output)[:PREVIEW_CHARS]
+
+
+def _tool_name(tool: Any) -> str:
+    """工具实例 / dict 形式工具声明的名字"""
+    if isinstance(tool, dict):
+        return str(tool.get("name") or "")
+    return str(getattr(tool, "name", "") or "")
+
+
+def filter_tools_by_names(tools: Sequence[Any], names: Sequence[str] | None) -> list[Any]:
+    """按 agent 配置的白名单过滤工具；None=全部，[]=一个都不给模型"""
+    if names is None:
+        return list(tools)
+    allowed = set(names)
+    return [tool for tool in tools if _tool_name(tool) in allowed]
+
+
+def count_tool_calls_this_turn(messages: Sequence[Any]) -> dict[str, int]:
+    """数本轮（最后一条 HumanMessage 之后）每种工具已被调用几次。
+
+    只看 tool_calls 声明，不依赖 ToolMessage：模型发出第 N 次调用的那一刻，
+    middleware 就要据此决定是否还把该工具开放给它。
+    """
+    start = 0
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            start = i + 1
+            break
+
+    counts: dict[str, int] = {}
+    for message in messages[start:]:
+        for call in getattr(message, "tool_calls", None) or []:
+            name = call.get("name", "") if isinstance(call, dict) else getattr(call, "name", "")
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def filter_tools_by_call_limit(
+    tools: Sequence[Any], messages: Sequence[Any], limits: dict[str, int]
+) -> list[Any]:
+    """已达 max_calls 的工具从本轮后续模型调用里摘掉，limit<=0 视为不限制。"""
+    if not limits:
+        return list(tools)
+    used = count_tool_calls_this_turn(messages)
+    return [
+        tool
+        for tool in tools
+        if not (
+            (limit := limits.get(_tool_name(tool), 0)) > 0
+            and used.get(_tool_name(tool), 0) >= limit
+        )
+    ]
 
 
 def date_line(now: datetime | None = None) -> str:
@@ -105,7 +206,8 @@ def compose_system_prompt(
     if set(tool_names) & CITATION_TOOLS:
         lines.append(
             "需要最新或你无法核实的信息时调用 web_search / read_url，"
-            "并在回答中用它们返回的编号 [n] 标注采用的来源。"
+            "并在回答中用它们返回的编号 [n] 标注参考来源；"
+            "不要在末尾另列“参考来源”清单，界面会单独展示。"
         )
     return "\n".join(lines)
 
@@ -221,7 +323,8 @@ class ModelAgent:
 
         middleware 是「一份图服务两种思考态」的关键：图绑的是快速态模型，
         每轮真正调模型前由它按 runtime.context 里的 thinking 换成深度态那份
-        （request.override 只改本次调用，不会污染实例上的图）。
+        （request.override 只改本次调用，不会污染实例上的图）。同一个 middleware
+        还按工具注册时的 max_calls 摘掉本轮已用尽的工具，避免模型反复调用。
 
         不再需要原来的双重校验锁：图在这里同步建好，调用链（ChatManager.build）
         从查库结果到建图之间没有 await，同一个事件循环线程内不会被打断，
@@ -230,15 +333,32 @@ class ModelAgent:
         from langchain.agents import create_agent
         from langchain.agents.middleware import wrap_model_call
 
+        tool_limits: dict[str, int] = {}
+        for tool in self.tools:
+            name = _tool_name(tool)
+            spec = get_tool_spec(name)
+            if spec is not None and spec.max_calls > 0:
+                tool_limits[name] = spec.max_calls
+
         @wrap_model_call
         async def select_thinking(request: Any, handler: Any) -> Any:
+            next_request = request
             context = request.runtime.context if request.runtime else None
             thinking = bool(isinstance(context, dict) and context.get("thinking"))
-            # 快速态直接放行：override 会 replace 出一个新的 request 对象，
-            # 而 ReAct 每轮工具后都要再调一次模型，没必要白拷一份
             if thinking and self.thinking_model is not None:
-                return await handler(request.override(model=self.thinking_model))
-            return await handler(request)
+                next_request = next_request.override(model=self.thinking_model)
+
+            tool_names = context.get("tool_names") if isinstance(context, dict) else None
+            if tool_names is not None or tool_limits:
+                allowed = filter_tools_by_names(next_request.tools, tool_names)
+                if tool_limits:
+                    allowed = filter_tools_by_call_limit(
+                        allowed, next_request.messages, tool_limits
+                    )
+                if len(allowed) != len(next_request.tools):
+                    next_request = next_request.override(tools=allowed)
+
+            return await handler(next_request)
 
         return create_agent(
             model=self.chat_model,
@@ -268,49 +388,137 @@ class ModelAgent:
 
     # ---------------- 流式对话 ----------------
 
-    async def stream(
+    async def astream(
         self,
         history: Sequence[Any],
         *,
         system_prompt: str | None = None,
         thinking: bool = False,
+        tool_names: Sequence[str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """只发起一次流式调用，把图事件交给 graph.stream_protocol 翻译成协议事件：
-        产出 token* / reasoning* / tool_start* / tool_end* / citations*。
+        """只发起一次 astream_events(v2)，把图事件逐个翻译成协议事件：
+        产出 segment_start* / token* / reasoning* / tool_start* / tool_end* / citations*。
 
-        事件语义与 astream_events(v2) 的映射表在 stream_protocol.py 模块头，
-        那里还记着为什么不用 astream(stream_mode="messages")（工具生命周期看不到）。
+        事件由 graph.stream_protocol 的 ev_* 工厂构造（字段名即前端契约）；本方法只负责
+        「从 astream_events 的哪个事件、取哪个字段」，映射表见 stream_protocol 模块头。
+
+        on_chat_model_start 是分段边界：一次流式回答里模型可能被调用多轮（工具执行后再来一轮），
+        每轮开一个 segment，segment_id 从 1 递增。service 后续按 segment 分段落库。
 
         不碰数据库、不管会话与落库（那些在 service.stream_chat()），异常也原样抛出，
         由调用方转成 error 事件。
 
         thinking 走 context 交给图里的中间件：True 且该行支持深度思考时才换成深度态模型
         （实测 astream_events 的 context kwarg 原样到达 request.runtime.context）。
+        tool_names 同理：None=模型池全部工具，[]=禁用所有工具，列表=只给白名单。
 
-        reasoning 是思考增量（只在深度档出现），与正文 token 分事件下发：
-        前端把它收进可折叠的「思考过程」块，不拼进回答文本，也不落库。
+        reasoning 是思考增量（只在深度档出现），来自 ReasoningChatOpenAI 接住的
+        reasoning_content，与正文 token 分事件下发，不进回答文本也不落库。
 
         citations 是工具返回的结构化引用（来自 on_tool_end 的 ToolMessage.artifact），
-        同样只转发不落库；正文里的 [n] 与卡片上的 n 同号，因为编号由工具从图状态里
-        接着本轮已用过的往下编。
+        只转发给前端；正文里的 [n] 与卡片上的 n 同号，因为编号由工具从图状态里
+        接着本轮已用过的往下编。工具调用本身（参数 / call_id / 完整结果 / 耗时）
+        由 service 从 tool_start / tool_end 收集，独立落到 chat_tool_calls 表。
 
         system_prompt 省略时回落到 self.system_prompt，传空串表示本轮不带系统消息。
         图里没有系统消息，所以每轮把它置于历史最前 —— 上游要求 system 在上下文头部。
         历史里已有的 system 行会被丢掉：/sessions/{id}/messages 允许写 system 角色，
         留着就是两条 system 且一条不在头部，部分 OpenAI 兼容上游会直接 400。
+
+        announced / pending 必须是生成器局部状态：同一个实例会被并发请求复用，
+        挂到 self 上会让后一个请求看不到前一个请求播报过的工具调用、也算错耗时。
+        pending 的键取 call_id（并行同名调用才能各算一次），个别上游不返回 id 时回退工具名；
+        值是本次调用待消费的中间参数（目前是 started_at），后续要带别的量直接往里加。
         """
+        announced: set[str] = set()
+        pending: dict[str, dict[str, Any]] = {}
+        segment_id = 0
+        visible_tool_names = (
+            list(tool_names)
+            if tool_names is not None
+            else [getattr(tool, "name", "") for tool in self.tools]
+        )
         prompt = compose_system_prompt(
             self.system_prompt if system_prompt is None else system_prompt,
-            [getattr(tool, "name", "") for tool in self.tools],
+            visible_tool_names,
         )
         turns = [m for m in history if not isinstance(m, SystemMessage)]
         messages = [SystemMessage(content=prompt), *turns] if prompt else [*turns]
-        async for event in stream_protocol.translate(
-            self.agent,
-            messages,
-            context={"thinking": self.effective_thinking(thinking)},
+        async for ev in self.agent.astream_events(
+            {"messages": messages},
+            version="v2",
+            context={
+                "thinking": self.effective_thinking(thinking),
+                "tool_names": list(tool_names) if tool_names is not None else None,
+            },
         ):
-            yield event
+            kind = ev["event"]
+
+            if kind == "on_chat_model_start":
+                # 每次模型起一轮就是一个新 segment（工具执行后模型再起一轮也会命中这里）
+                segment_id += 1
+                yield ev_segment_start(segment_id)
+
+            elif kind == "on_chat_model_stream":
+                chunk = (ev.get("data") or {}).get("chunk")
+                if not isinstance(chunk, AIMessageChunk):
+                    continue
+                # 思考增量：由 settings.llm.ReasoningChatOpenAI 从 delta 里接住，父类会直接丢掉
+                reasoning = (chunk.additional_kwargs or {}).get("reasoning_content")
+                if isinstance(reasoning, str) and reasoning:
+                    yield ev_reasoning(reasoning)
+                text = _text_of(chunk.content)
+                if text:
+                    yield ev_token(text)
+
+            elif kind == "on_chat_model_end":
+                # 工具调用到此已装配成 {name, args, id}：call_id 与完整入参只有此刻同时齐备
+                # （模型流里的 tool_call_chunks 把 args 切成碎片、on_tool_start 又没有 tool_call_id），
+                # 故 tool_start 从这里发。工具执行紧贴在本事件之后，徽标不会因此迟亮。
+                out = (ev.get("data") or {}).get("output")
+                for call in getattr(out, "tool_calls", None) or []:
+                    name = call.get("name") or ""
+                    call_id = call.get("id") or ""
+                    key = call_id or name
+                    if key and key not in announced:
+                        announced.add(key)
+                        pending[key] = {
+                            "started_at": time.perf_counter(),
+                            "name": name,
+                            "call_id": call_id,
+                        }
+                        yield ev_tool_start(name, call_id, call.get("args"))
+
+            elif kind == "on_tool_end":
+                name = ev.get("name") or ""
+                output = (ev.get("data") or {}).get("output")
+                # tool_call_id 回指 on_chat_model_end 播报过的那次调用，前端据此配对翻状态
+                call_id = getattr(output, "tool_call_id", "") or ""
+                # 先算耗时再发事件：citations/tool_end 的 yield 会等下游消费，不能算进工具执行时间
+                state = pending.pop(call_id or name, None)
+                if state is None and call_id:
+                    state = pending.pop(name, None)
+                started_at = state.pop("started_at", None) if state else None
+                duration_ms = None if started_at is None else round((time.perf_counter() - started_at) * 1000)
+                # 正文只从 on_chat_model_stream 取，工具原文不会泄进正文（这里不涉及防泄漏）；
+                # 这个 isinstance 纯粹是防御性：本项目工具恒回 ToolMessage（实测），但 langchain
+                # 不保证这一点——工具返回 Command（state 更新 / interrupt / 子图路由）等非消息时，
+                # artifact 只在 ToolMessage 上，取不到就跳过，别把非消息喂给 extract_citations。
+                # citations 先于 tool_end 发，前端收到徽标「完成」时来源卡片已在路上
+                if isinstance(output, ToolMessage):
+                    items = extract_citations(output)
+                    if items:
+                        yield ev_citations(name, items, call_id)
+                yield ev_tool_end(
+                    name,
+                    _preview_of(output),
+                    call_id,
+                    duration_ms,
+                    result=_result_of(output),
+                )
+
+    # 兼容既有调用方与测试；实现以 astream 为准
+    stream = astream
 
 
 class ChatManager:

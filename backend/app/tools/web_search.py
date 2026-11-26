@@ -76,6 +76,8 @@ def format_results(
     tags=["search"],
     category=ToolCategory.SEARCH,
     icon="globe",
+    label="联网搜索",
+    max_calls=3,
     requires_env=["TAVILY_API_KEY"],
     example='web_search(query="2026 年诺贝尔物理学奖", max_results=3)',
 )

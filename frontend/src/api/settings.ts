@@ -2,7 +2,7 @@
  * 设置类接口封装：对接后端 /settings/*（开发环境经 Vite 代理到 FastAPI）
  */
 
-import { ApiError, ensureFreshToken, getToken } from './auth'
+import { ApiError, ensureFreshToken, getToken, request } from './auth'
 
 export interface ModelProviderOption {
   value: string
@@ -94,6 +94,126 @@ export interface ChatModelOption {
 /** 拉取对话可选的模型列表 */
 export function getChatModels(): Promise<ChatModelOption[]> {
   return llmRequest<ChatModelOption[]>('/settings/models')
+}
+
+/** 当前真正挂进模型池的工具（后端 /settings/tools：登录即可读） */
+export interface ToolDto {
+  name: string
+  /** 注册时声明的中文展示名，侧边栏显示它 */
+  label: string
+  /** lucide 图标名，前端按名取内联 SVG */
+  icon: string
+}
+
+/** 侧边栏「工具」悬停面板用：只列当前可用工具 */
+export function listTools(): Promise<ToolDto[]> {
+  return request<ToolDto[]>('/settings/tools', { withAuth: true })
+}
+
+/* ---------------- Agent 定义与提示词版本 ---------------- */
+
+export interface AgentDto {
+  id: number
+  agent_key: string
+  name: string
+  description: string
+  platform: string
+  model: string
+  thinking: boolean
+  /** null=全部工具，[]=禁用所有工具；列表来自 readonly 响应式副本 */
+  tool_names: readonly string[] | null
+  active_prompt_version: number
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface AgentPromptDto {
+  id: number
+  agent_id: number
+  version: number
+  system_prompt: string
+  note: string
+  created_at: string
+}
+
+export interface AgentCreatePayload {
+  agent_key: string
+  name?: string
+  description?: string
+  platform?: string
+  model?: string
+  thinking?: boolean
+  tool_names?: string[] | null
+  system_prompt?: string
+}
+
+export interface AgentUpdatePayload {
+  name?: string
+  description?: string
+  platform?: string
+  model?: string
+  thinking?: boolean
+  tool_names?: string[] | null
+  active_prompt_version?: number
+  is_active?: boolean
+}
+
+export interface AgentPromptCreatePayload {
+  system_prompt: string
+  note?: string
+  activate?: boolean
+}
+
+const jsonBody = (payload: unknown): string => JSON.stringify(payload)
+
+export function listAgents(includeInactive = false): Promise<AgentDto[]> {
+  return request<AgentDto[]>(`/agents?include_inactive=${includeInactive}`, { withAuth: true })
+}
+
+export function createAgent(payload: AgentCreatePayload): Promise<AgentDto> {
+  return request<AgentDto>('/agents', {
+    method: 'POST',
+    withAuth: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: jsonBody(payload),
+  })
+}
+
+export function updateAgent(id: number, payload: AgentUpdatePayload): Promise<AgentDto> {
+  return request<AgentDto>(`/agents/${id}`, {
+    method: 'PATCH',
+    withAuth: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: jsonBody(payload),
+  })
+}
+
+export function deleteAgent(id: number): Promise<void> {
+  return request<void>(`/agents/${id}`, { method: 'DELETE', withAuth: true })
+}
+
+export function listAgentPrompts(id: number): Promise<AgentPromptDto[]> {
+  return request<AgentPromptDto[]>(`/agents/${id}/prompts`, { withAuth: true })
+}
+
+export function createAgentPrompt(
+  id: number,
+  payload: AgentPromptCreatePayload,
+): Promise<AgentPromptDto> {
+  return request<AgentPromptDto>(`/agents/${id}/prompts`, {
+    method: 'POST',
+    withAuth: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: jsonBody(payload),
+  })
+}
+
+export function activateAgentPrompt(id: number, version: number): Promise<AgentDto> {
+  return request<AgentDto>(`/agents/${id}/prompts/${version}/activate`, {
+    method: 'POST',
+    withAuth: true,
+  })
 }
 
 /** 连通性测试结果（与后端 ProviderTestResult 对齐） */

@@ -3,15 +3,35 @@ import { computed, ref, watch } from 'vue'
 import { useLlm, PLATFORM_PRESET, type LlmProviderConfig } from '../stores/llm'
 import { useAuth } from '../stores/auth'
 import { useModels } from '../stores/models'
-import { getModelProviders, testLlmProvider, type LlmTestResult } from '../api/settings'
+import {
+  activateAgentPrompt,
+  createAgent,
+  createAgentPrompt,
+  deleteAgent,
+  getChatModels,
+  getModelProviders,
+  listAgentPrompts,
+  listAgents,
+  listTools,
+  testLlmProvider,
+  updateAgent,
+  type AgentDto,
+  type AgentPromptDto,
+  type ChatModelOption,
+  type LlmTestResult,
+  type ToolDto,
+} from '../api/settings'
+import { useAgents } from '../stores/agents'
 
 /** v-model 控制显隐 */
 const open = defineModel<boolean>({ required: true })
 
 const { providers, activeId, addProvider, updateProvider, removeProvider, setActive, saveAll, saving, load, loading: loadingLlm, loadError, saveError: lastSaveError } = useLlm()
-const { user, isLoggedIn, logout } = useAuth()
+const { user, isLoggedIn, isAdmin, logout } = useAuth()
 // 保存成功后作废对话框模型列表的缓存，让刚接入的模型立刻可选
 const { load: loadModels } = useModels()
+// 保存 agent 配置后立刻刷新对话区可选列表
+const { load: loadChatAgents } = useAgents()
 
 type NavKey = 'account' | 'general' | 'model' | 'plugins' | 'agent'
 type Platform = LlmProviderConfig['platform']
@@ -23,6 +43,11 @@ const NAV_ITEMS: { key: NavKey; label: string }[] = [
   { key: 'plugins', label: '内置插件' },
   { key: 'agent', label: 'Agent 预设' },
 ]
+
+/** Agent 管理只有管理员可见；普通用户看不到占位入口 */
+const visibleNavItems = computed(() =>
+  NAV_ITEMS.filter((item) => item.key !== 'agent' || isAdmin.value),
+)
 
 const nav = ref<NavKey>('model')
 /** 表单容器顶部分段切换：第三方提供商 / 自定义 API */
@@ -48,6 +73,187 @@ const displayName = ref('')
 /** 显示名称留空时保存被拦下的标记（打开表单不立刻标红，点了保存才提示） */
 const nameError = ref(false)
 const supportsThinking = ref(true)
+
+/* ---------------- Agent 管理 ---------------- */
+const adminAgents = ref<AgentDto[]>([])
+const adminPrompts = ref<AgentPromptDto[]>([])
+const agentTools = ref<ToolDto[]>([])
+const agentModels = ref<ChatModelOption[]>([])
+const agentLoading = ref(false)
+const agentError = ref('')
+const agentSaved = ref('')
+const agentFormOpen = ref(false)
+const agentEditingId = ref<number | null>(null)
+const agKey = ref('')
+const agName = ref('')
+const agDescription = ref('')
+const agPlatform = ref('')
+const agModel = ref('')
+const agThinking = ref(false)
+const agToolMode = ref<'all' | 'picked'>('all')
+const agToolNames = ref<string[]>([])
+const agPrompt = ref('')
+const agPromptNote = ref('')
+const agentPlatforms = computed(() => [...new Set(agentModels.value.map((m) => m.platform))])
+
+function resetAgentForm() {
+  agentEditingId.value = null
+  agKey.value = ''
+  agName.value = ''
+  agDescription.value = ''
+  agPlatform.value = ''
+  agModel.value = ''
+  agThinking.value = false
+  agToolMode.value = 'all'
+  agToolNames.value = []
+  agPrompt.value = ''
+  agPromptNote.value = ''
+  adminPrompts.value = []
+  agentSaved.value = ''
+  agentError.value = ''
+}
+
+async function loadAdminAgentData() {
+  if (!isAdmin.value) return
+  agentLoading.value = true
+  agentError.value = ''
+  try {
+    const [list, tools, models] = await Promise.all([
+      listAgents(true),
+      listTools(),
+      getChatModels(),
+    ])
+    adminAgents.value = list
+    agentTools.value = tools
+    agentModels.value = models
+  } catch (e) {
+    agentError.value = e instanceof Error ? e.message : '加载 Agent 配置失败'
+  } finally {
+    agentLoading.value = false
+  }
+}
+
+async function loadAgentPrompts(id: number) {
+  try {
+    adminPrompts.value = await listAgentPrompts(id)
+  } catch {
+    adminPrompts.value = []
+  }
+}
+
+function editAgent(agent: AgentDto) {
+  agentEditingId.value = agent.id
+  agKey.value = agent.agent_key
+  agName.value = agent.name
+  agDescription.value = agent.description
+  agPlatform.value = agent.platform
+  agModel.value = agent.model
+  agThinking.value = agent.thinking
+  agToolMode.value = agent.tool_names === null ? 'all' : 'picked'
+  agToolNames.value = [...(agent.tool_names ?? [])]
+  agPrompt.value = ''
+  agPromptNote.value = ''
+  agentSaved.value = ''
+  agentError.value = ''
+  agentFormOpen.value = true
+  void loadAgentPrompts(agent.id)
+}
+
+function toggleAgentTool(name: string) {
+  const i = agToolNames.value.indexOf(name)
+  if (i >= 0) agToolNames.value.splice(i, 1)
+  else agToolNames.value.push(name)
+}
+
+async function saveAgent() {
+  agentSaved.value = ''
+  agentError.value = ''
+  const key = agKey.value.trim()
+  if (!/^[a-z][a-z0-9_]{1,63}$/.test(key)) {
+    agentError.value = 'agent_key 只能用小写字母、数字和下划线，且要以字母开头'
+    return
+  }
+  const toolNames = agToolMode.value === 'all' ? null : agToolNames.value
+  const prompt = agPrompt.value.trim()
+  try {
+    if (agentEditingId.value === null) {
+      const created = await createAgent({
+        agent_key: key,
+        name: agName.value.trim(),
+        description: agDescription.value.trim(),
+        platform: agPlatform.value.trim(),
+        model: agModel.value.trim(),
+        thinking: agThinking.value,
+        tool_names: toolNames,
+        system_prompt: prompt || undefined,
+      })
+      agentEditingId.value = created.id
+    } else {
+      await updateAgent(agentEditingId.value, {
+        name: agName.value.trim(),
+        description: agDescription.value.trim(),
+        platform: agPlatform.value.trim(),
+        model: agModel.value.trim(),
+        thinking: agThinking.value,
+        tool_names: toolNames,
+        is_active: true,
+      })
+      if (prompt) {
+        await createAgentPrompt(agentEditingId.value, {
+          system_prompt: prompt,
+          note: agPromptNote.value.trim() || undefined,
+          activate: true,
+        })
+      }
+    }
+    await loadAdminAgentData()
+    await loadAgentPrompts(agentEditingId.value)
+    void loadChatAgents(true)
+    agentSaved.value = prompt ? '已保存并发布新提示词版本' : '已保存'
+    agPrompt.value = ''
+    agPromptNote.value = ''
+  } catch (e) {
+    agentError.value = e instanceof Error ? e.message : '保存 Agent 失败'
+  }
+}
+
+async function removeAgent() {
+  if (agentEditingId.value === null) return
+  const target = adminAgents.value.find((a) => a.id === agentEditingId.value)
+  if (!target || !window.confirm(`确认删除 Agent「${target.name || target.agent_key}」？`)) return
+  agentError.value = ''
+  try {
+    await deleteAgent(target.id)
+    resetAgentForm()
+    agentFormOpen.value = false
+    await loadAdminAgentData()
+    void loadChatAgents(true)
+  } catch (e) {
+    agentError.value = e instanceof Error ? e.message : '删除 Agent 失败'
+  }
+}
+
+async function activateVersion(version: number) {
+  if (agentEditingId.value === null) return
+  agentError.value = ''
+  try {
+    await activateAgentPrompt(agentEditingId.value, version)
+    await loadAdminAgentData()
+    await loadAgentPrompts(agentEditingId.value)
+    void loadChatAgents(true)
+    agentSaved.value = `已切换到 v${version}`
+  } catch (e) {
+    agentError.value = e instanceof Error ? e.message : '切换提示词版本失败'
+  }
+}
+
+watch(nav, (value) => {
+  if (value === 'agent' && isAdmin.value) void loadAdminAgentData()
+  if (value === 'model') {
+    // 切回模型页时回到列表视图；表单只在点「新增/编辑」后出现
+    formOpen.value = false
+  }
+})
 
 // 任一连接相关字段变化时，清除旧的测试结果避免误导
 watch([baseUrl, apiKey, defaultModel], () => {
@@ -108,8 +314,8 @@ function loadDraft() {
   testResult.value = null
   logoutConfirm.value = false
   nameError.value = false
-  // 默认只展示列表；一行都没有时直接展开表单引导首次接入
-  formOpen.value = !target
+  // 默认始终只展示列表；即使一行都没有，也由用户点「+ 新增模型」再展开
+  formOpen.value = false
   if (target) {
     fillForm(target)
     return
@@ -350,7 +556,7 @@ async function onTest() {
           <!-- 左侧导航 -->
           <nav class="w-[180px] shrink-0 border-r border-stone-200 py-4 px-3 space-y-1">
             <button
-              v-for="item in NAV_ITEMS"
+              v-for="item in visibleNavItems"
               :key="item.key"
               type="button"
               @click="nav = item.key"
@@ -693,6 +899,199 @@ async function onTest() {
                 </button>
               </div>
               <p v-else class="mt-4 text-[12.5px] text-stone-400">当前未登录，依赖账户的功能不可用。</p>
+            </template>
+
+            <!-- Agent 预设：管理员在线定义 agent / 发布提示词版本 -->
+            <template v-else-if="nav === 'agent'">
+              <div class="flex items-start justify-between gap-4">
+                <div>
+                  <h3 class="text-[17px] font-semibold text-stone-800">Agent 预设</h3>
+                  <p class="mt-1 text-[12.5px] text-stone-400">
+                    管理员维护；每个 agent 可独立配置模型、工具白名单与提示词版本。
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  @click="resetAgentForm(); agentFormOpen = true"
+                  class="h-8 px-3 shrink-0 rounded-lg bg-stone-800 text-[12.5px] text-white hover:bg-stone-700 transition"
+                >
+                  + 新增 Agent
+                </button>
+              </div>
+
+              <p v-if="agentError" class="mt-3 rounded-lg bg-red-50 px-3 py-2 text-[12px] text-red-600">{{ agentError }}</p>
+              <p v-if="agentSaved" class="mt-3 rounded-lg bg-green-50 px-3 py-2 text-[12px] text-green-700">{{ agentSaved }}</p>
+              <p v-if="agentLoading" class="mt-3 text-[12px] text-stone-400">加载中…</p>
+
+              <div v-if="!agentFormOpen" class="mt-4 space-y-2">
+                <button
+                  v-for="a in adminAgents"
+                  :key="a.id"
+                  type="button"
+                  @click="editAgent(a)"
+                  class="w-full flex items-center justify-between gap-3 rounded-xl border border-stone-200 px-4 py-3 text-left hover:bg-stone-50 transition"
+                >
+                  <span class="min-w-0">
+                    <span class="block text-[13.5px] font-medium text-stone-800 truncate">
+                      {{ a.name || a.agent_key }}
+                      <span v-if="!a.is_active" class="ml-1 text-[10.5px] text-stone-400">已停用</span>
+                    </span>
+                    <span class="block text-[11.5px] text-stone-400 truncate">
+                      {{ a.agent_key }} · {{ a.platform || '默认平台' }} / {{ a.model || '默认模型' }} · 提示词 v{{ a.active_prompt_version }}
+                    </span>
+                  </span>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="shrink-0 text-stone-400" stroke-linecap="round">
+                    <path d="m9 18 6-6-6-6" />
+                  </svg>
+                </button>
+                <p v-if="!adminAgents.length && !agentLoading" class="py-8 text-center text-[12.5px] text-stone-400">还没有 Agent，点右上角新增。</p>
+              </div>
+
+              <div v-else class="mt-4 space-y-4">
+                <div class="grid grid-cols-2 gap-3">
+                  <label class="text-[12px] text-stone-600">
+                    agent_key
+                    <input
+                      v-model="agKey"
+                      :disabled="agentEditingId !== null"
+                      maxlength="64"
+                      placeholder="chat / planner"
+                      class="mt-1 h-9 w-full rounded-lg border border-stone-200 px-2.5 text-[12.5px] disabled:bg-stone-50 disabled:text-stone-400"
+                    />
+                  </label>
+                  <label class="text-[12px] text-stone-600">
+                    名称
+                    <input v-model="agName" maxlength="128" class="mt-1 h-9 w-full rounded-lg border border-stone-200 px-2.5 text-[12.5px]" />
+                  </label>
+                </div>
+
+                <label class="block text-[12px] text-stone-600">
+                  描述
+                  <input v-model="agDescription" maxlength="255" class="mt-1 h-9 w-full rounded-lg border border-stone-200 px-2.5 text-[12.5px]" />
+                </label>
+
+                <div class="grid grid-cols-2 gap-3">
+                  <label class="text-[12px] text-stone-600">
+                    平台（留空沿用请求）
+                    <select v-model="agPlatform" class="mt-1 h-9 w-full rounded-lg border border-stone-200 px-2 text-[12.5px]">
+                      <option value="">默认</option>
+                      <option v-for="p in agentPlatforms" :key="p" :value="p">{{ p }}</option>
+                    </select>
+                  </label>
+                  <label class="text-[12px] text-stone-600">
+                    模型（留空沿用请求）
+                    <input v-model="agModel" list="agent-model-options" maxlength="128" class="mt-1 h-9 w-full rounded-lg border border-stone-200 px-2.5 text-[12.5px]" />
+                    <datalist id="agent-model-options">
+                      <option v-for="m in agentModels" :key="m.platform + '/' + m.model" :value="m.model" />
+                    </datalist>
+                  </label>
+                </div>
+
+                <label class="flex items-center gap-2 text-[12.5px] text-stone-600">
+                  <input v-model="agThinking" type="checkbox" class="h-4 w-4 accent-stone-800" />
+                  默认开启深度思考（请求里显式选择时仍以请求为准）
+                </label>
+
+                <div class="rounded-xl border border-stone-200 p-3">
+                  <p class="text-[12.5px] font-medium text-stone-700">工具白名单</p>
+                  <div class="mt-2 flex items-center gap-4 text-[12px] text-stone-600">
+                    <label class="flex items-center gap-1.5">
+                      <input v-model="agToolMode" type="radio" value="all" class="accent-stone-800" />
+                      全部工具
+                    </label>
+                    <label class="flex items-center gap-1.5">
+                      <input v-model="agToolMode" type="radio" value="picked" class="accent-stone-800" />
+                      仅勾选
+                    </label>
+                  </div>
+                  <div v-if="agToolMode === 'picked'" class="mt-2 flex flex-wrap gap-2">
+                    <label
+                      v-for="t in agentTools"
+                      :key="t.name"
+                      class="inline-flex items-center gap-1.5 rounded-lg border border-stone-200 px-2.5 py-1 text-[12px] text-stone-600"
+                    >
+                      <input type="checkbox" :checked="agToolNames.includes(t.name)" @change="toggleAgentTool(t.name)" class="accent-stone-800" />
+                      {{ t.label || t.name }}
+                    </label>
+                    <p v-if="!agentTools.length" class="text-[12px] text-stone-400">当前没有可用工具</p>
+                  </div>
+                </div>
+
+                <div class="rounded-xl border border-stone-200 p-3">
+                  <p class="text-[12.5px] font-medium text-stone-700">系统提示词</p>
+                  <p class="mt-0.5 text-[11.5px] text-stone-400">留空表示不改；填写后会发布一个新版本并自动生效。</p>
+                  <textarea
+                    v-model="agPrompt"
+                    rows="5"
+                    maxlength="20000"
+                    placeholder="你是……"
+                    class="mt-2 w-full resize-y rounded-lg border border-stone-200 px-2.5 py-2 text-[12.5px] leading-[1.6]"
+                  />
+                  <input
+                    v-model="agPromptNote"
+                    maxlength="255"
+                    placeholder="版本备注（可选）"
+                    class="mt-2 h-8 w-full rounded-lg border border-stone-200 px-2.5 text-[12px]"
+                  />
+                </div>
+
+                <div v-if="adminPrompts.length" class="rounded-xl border border-stone-200 p-3">
+                  <p class="text-[12.5px] font-medium text-stone-700">提示词版本</p>
+                  <div class="mt-2 max-h-40 space-y-1 overflow-y-auto scroll-thin">
+                    <div
+                      v-for="p in adminPrompts"
+                      :key="p.version"
+                      class="flex items-center justify-between gap-2 rounded-lg bg-stone-50 px-2.5 py-1.5 text-[11.5px]"
+                    >
+                      <button
+                        type="button"
+                        @click="agPrompt = p.system_prompt; agPromptNote = p.note"
+                        class="min-w-0 truncate text-left text-stone-600 hover:text-stone-900"
+                        :title="p.system_prompt"
+                      >
+                        v{{ p.version }} · {{ p.note || '无备注' }}
+                      </button>
+                      <span v-if="p.version === adminAgents.find((a) => a.id === agentEditingId)?.active_prompt_version" class="shrink-0 text-[10.5px] text-green-600">生效中</span>
+                      <button
+                        v-else
+                        type="button"
+                        @click="activateVersion(p.version)"
+                        class="shrink-0 text-[11px] text-stone-500 hover:text-stone-900"
+                      >
+                        启用
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="flex items-center justify-between gap-3">
+                  <button
+                    v-if="agentEditingId !== null"
+                    type="button"
+                    @click="removeAgent"
+                    class="h-9 px-3 rounded-lg border border-red-200 text-[12.5px] text-red-600 hover:bg-red-50 transition"
+                  >
+                    删除
+                  </button>
+                  <span v-else />
+                  <div class="flex items-center gap-2">
+                    <button
+                      type="button"
+                      @click="agentFormOpen = false"
+                      class="h-9 px-4 rounded-lg border border-stone-200 text-[12.5px] text-stone-600 hover:bg-stone-50 transition"
+                    >
+                      返回
+                    </button>
+                    <button
+                      type="button"
+                      @click="saveAgent"
+                      class="h-9 px-5 rounded-lg bg-stone-800 text-[12.5px] text-white hover:bg-stone-700 transition"
+                    >
+                      保存
+                    </button>
+                  </div>
+                </div>
+              </div>
             </template>
 
             <!-- 其他导航：占位 -->

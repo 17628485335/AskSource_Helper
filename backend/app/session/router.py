@@ -31,6 +31,7 @@ from .schemas import (
     SessionOut,
     SessionPage,
     SessionUpdate,
+    ToolCallOut,
 )
 
 # 路径已含 /sessions 前缀，此处不再设 prefix，否则会拼成 /sessions/sessions
@@ -199,7 +200,16 @@ async def read_messages(
 ) -> list[MessageOut]:
     await _owned_session(db, session_id, current_user.id)
     rows = await service.load_messages(db, session_id, limit=limit, before_id=before_id)
-    return [MessageOut.model_validate(r) for r in rows]
+    tool_rows = await service.load_tool_calls(db, [r.id for r in rows])
+    tools_by_message: dict[int, list[ToolCallOut]] = {}
+    for tool in tool_rows:
+        tools_by_message.setdefault(tool.message_id, []).append(ToolCallOut.model_validate(tool))
+    return [
+        MessageOut.model_validate(r).model_copy(
+            update={"tool_calls": tools_by_message.get(r.id, [])}
+        )
+        for r in rows
+    ]
 
 
 @router.get(
@@ -217,5 +227,11 @@ async def read_history(
     await _owned_session(db, session_id, current_user.id)
     rows = await service.load_messages(db, session_id, limit=limit)
     return [
-        HistoryMessage(role=r.role, content=r.content, tool_name=r.tool_name) for r in rows
+        HistoryMessage(
+            role=r.role,
+            content=r.content,
+            tool_name=r.tool_name,
+            turn_id=r.turn_id,
+        )
+        for r in rows
     ]

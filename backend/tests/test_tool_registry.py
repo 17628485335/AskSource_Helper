@@ -77,6 +77,8 @@ def test_metadata_lands_on_spec():
         "meta_probe",
         category=ToolCategory.DATA,
         icon="database",
+        label="  数据探针  ",
+        max_calls=2,
         tags=["probe", " search "],  # 顺手验证首尾空格的归一
         dangerous=True,
         requires_env=["SOME_TOKEN", " "],
@@ -89,6 +91,8 @@ def test_metadata_lands_on_spec():
         assert spec is not None
         assert spec.category == "data", "分类要存成纯字符串，别存成 Enum repr"
         assert spec.icon == "database"
+        assert spec.label == "数据探针"
+        assert spec.max_calls == 2
         assert spec.tags == ("probe", "search")
         assert spec.dangerous is True
         assert spec.requires_env == ("SOME_TOKEN",), "空白项该被丢掉"
@@ -100,12 +104,19 @@ def test_metadata_lands_on_spec():
         _cleanup("meta_probe")
 
 
+def test_negative_max_calls_rejected():
+    with pytest.raises(ValueError, match="不能为负数"):
+        _make("bad_limit_probe", max_calls=-1)
+
+
 def test_defaults_are_a_plain_auto_mounting_tool():
     _make("plain_probe")
     try:
         spec = get_tool_spec("plain_probe")
         assert spec.category == ToolCategory.CORE.value
         assert spec.icon == "wrench"
+        assert spec.label == "plain_probe", "没声明中文名时回退到工具名"
+        assert spec.max_calls == 0, "默认不限制调用次数"
         assert spec.tags == ()
         assert spec.dangerous is False and spec.needs_root is False
         assert spec.requires_env == () and spec.example == ""

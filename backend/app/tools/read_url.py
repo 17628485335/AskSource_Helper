@@ -96,6 +96,7 @@ def format_pages(
     tags=["search"],
     category=ToolCategory.SEARCH,
     icon="file-text",
+    label="网页正文读取",
     requires_env=["TAVILY_API_KEY"],
     example='read_url(urls=["https://example.com/post"], query="上市日期")',
 )

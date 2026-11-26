@@ -1,7 +1,7 @@
 """会话模块的 Pydantic 请求 / 响应模型"""
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -35,6 +35,27 @@ class MessageCreate(BaseModel):
     tokens: int = Field(default=0, ge=0)
 
 
+class ToolCallOut(BaseModel):
+    """一次工具调用的结构化记录（从 chat_tool_calls 表读出）"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    session_id: int
+    message_id: int
+    seq: int
+    tool_name: str
+    call_id: str
+    created_at: datetime
+    turn_id: int | None = None
+    segment_id: int | None = None
+    input_json: dict[str, Any] | None = None
+    result_text: str = ""
+    preview: str = ""
+    duration_ms: int | None = None
+    citations_json: list[dict[str, Any]] | None = None
+
+
 class MessageOut(BaseModel):
     """消息响应元素"""
 
@@ -47,6 +68,8 @@ class MessageOut(BaseModel):
     tool_name: str
     tokens: int
     created_at: datetime
+    turn_id: int | None = None
+    tool_calls: list[ToolCallOut] = Field(default_factory=list)
 
 
 class SessionOut(BaseModel):
@@ -81,3 +104,4 @@ class HistoryMessage(BaseModel):
     role: str
     content: str
     tool_name: str = ""
+    turn_id: int | None = None

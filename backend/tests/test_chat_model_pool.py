@@ -27,7 +27,10 @@ from app.chat.chat_manager import (
     DEFAULT_SYSTEM_PROMPT,
     LOCAL_TZ,
     compose_system_prompt,
+    count_tool_calls_this_turn,
     date_line,
+    filter_tools_by_call_limit,
+    filter_tools_by_names,
 )
 from app.settings.llm import ReasoningChatOpenAI, _reasoning_delta, build_model
 
@@ -380,7 +383,7 @@ def test_compose_prompt_appends_date_and_only_mentions_citations_when_tools_exis
 
 
 class _StubGraph:
-    """只回放 astream_events 形状的事件字典（translate 只吃 on_chat_model_stream 等协议源事件），
+    """只回放 astream_events 形状的事件字典（ModelAgent.stream 只吃 on_chat_model_stream/end 等协议源事件），
     顺带记下每轮的 messages 供断言注入"""
 
     def __init__(self) -> None:
@@ -413,11 +416,67 @@ def test_date_is_computed_per_turn_not_frozen_at_pool_build(monkeypatch):
     assert graph.prompts[1].startswith(DEFAULT_SYSTEM_PROMPT)
 
 
-def _tool_end(name: str, content: str, artifact: dict | None = None) -> dict:
-    msg = ToolMessage(content=content, tool_call_id="c", name=name)
+def test_tool_whitelist_none_is_all_empty_is_none():
+    tools = [SimpleNamespace(name="web_search"), SimpleNamespace(name="read_url")]
+    assert [t.name for t in filter_tools_by_names(tools, None)] == ["web_search", "read_url"]
+    assert filter_tools_by_names(tools, []) == []
+    assert [t.name for t in filter_tools_by_names(tools, ["read_url"])] == ["read_url"]
+
+
+def test_tool_call_limit_counts_only_current_turn_and_filters_exhausted_tools():
+    """上一轮的历史不占额度；达到 max_calls 的工具从后续模型调用里摘掉"""
+    old_turn = AIMessage(
+        content="",
+        tool_calls=[{"name": "web_search", "args": {}, "id": "old", "type": "tool_call"}],
+    )
+    current_turn = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "web_search", "args": {}, "id": "c1", "type": "tool_call"},
+            {"name": "web_search", "args": {}, "id": "c2", "type": "tool_call"},
+            {"name": "read_url", "args": {}, "id": "c3", "type": "tool_call"},
+        ],
+    )
+    messages = [
+        HumanMessage(content="上一轮"),
+        old_turn,
+        ToolMessage(content="旧结果", tool_call_id="old"),
+        HumanMessage(content="这一轮"),
+        current_turn,
+        ToolMessage(content="结果", tool_call_id="c1"),
+    ]
+
+    counts = count_tool_calls_this_turn(messages)
+    assert counts == {"web_search": 2, "read_url": 1}
+
+    tools = [SimpleNamespace(name="web_search"), SimpleNamespace(name="read_url")]
+    kept = filter_tools_by_call_limit(tools, messages, {"web_search": 3, "read_url": 1})
+    assert [t.name for t in kept] == ["web_search"]
+    # 没写上限的工具不受影响
+    assert [t.name for t in filter_tools_by_call_limit(tools, messages, {"web_search": 2})] == [
+        "read_url"
+    ]
+
+
+def _tool_end(name: str, content: str, artifact: dict | None = None, call_id: str = "c") -> dict:
+    msg = ToolMessage(content=content, tool_call_id=call_id, name=name)
     if artifact is not None:
         msg.artifact = artifact
     return {"event": "on_tool_end", "name": name, "data": {"output": msg}}
+
+
+def _model_end_tool_calls(calls: list[dict]) -> dict:
+    """on_chat_model_end 的新协议源：output 是装配好 tool_calls 的 AIMessage"""
+    msg = AIMessage(
+        content="",
+        tool_calls=[{**c, "type": "tool_call"} for c in calls],
+    )
+    return {"event": "on_chat_model_end", "data": {"output": msg}}
+
+
+def _model_start() -> dict:
+    """on_chat_model_start：一次模型调用的开头，即一个新 segment 的边界"""
+    return {"event": "on_chat_model_start", "data": {"input": {"messages": []}}}
 
 
 class _ReplayGraph:
@@ -434,15 +493,22 @@ class _ReplayGraph:
 def test_tool_message_becomes_citations_instead_of_answer_text(monkeypatch):
     """工具的返回值不是助手的话：既不能当正文下发，引用又要能取出来"""
     monkeypatch.setattr(chat_manager_module, "build_model", lambda *_a, **_k: _SpyMessagesModel())
+    ticks = iter([1.0, 1.0, 1.5, 2.25])  # 两次 start；两次 end（分别耗时 500 / 1250 ms）
+    monkeypatch.setattr(
+        chat_manager_module, "time", SimpleNamespace(perf_counter=lambda: next(ticks))
+    )
     agent = ModelAgent("deepseek", "deepseek-chat", api_key="sk-1", tools=[])
 
     items = [{"index": 1, "url": "https://a.example", "title": "A"}]
     agent.agent = _ReplayGraph(
         [
-            {"event": "on_tool_start", "name": "web_search", "data": {"input": {"query": "q"}}},
-            _tool_end("web_search", "检索「q」得到 1 条结果：[1] A", {"citations": items, "tools": "web_search"}),
-            {"event": "on_tool_start", "name": "noop", "data": {"input": {}}},
-            _tool_end("noop", "工具啥也没返回"),
+            # tool_start 取自 on_chat_model_end 装配好的 tool_calls（带 call_id + 完整入参）
+            _model_end_tool_calls([
+                {"name": "web_search", "args": {"query": "q"}, "id": "call_w"},
+                {"name": "noop", "args": {}, "id": "call_n"},
+            ]),
+            _tool_end("web_search", "检索「q」得到 1 条结果：[1] A", {"citations": items, "tools": "web_search"}, call_id="call_w"),
+            _tool_end("noop", "工具啥也没返回", call_id="call_n"),
             {"event": "on_chat_model_stream", "data": {"chunk": AIMessageChunk(content="据 [1] ")}},
             {"event": "on_chat_model_stream", "data": {"chunk": AIMessageChunk(content="答案是 A。")}},
         ]
@@ -453,11 +519,48 @@ def test_tool_message_becomes_citations_instead_of_answer_text(monkeypatch):
 
     events = asyncio.run(ask())
     assert [e["type"] for e in events] == [
-        "tool_start", "citations", "tool_end", "tool_start", "tool_end", "token", "token",
+        "tool_start", "tool_start", "citations", "tool_end", "tool_end", "token", "token",
     ]
-    assert events[1] == {"type": "citations", "tool": "web_search", "items": items}
+    # tool_start 携 call_id 与装配好的完整入参（model_end 一次报两个，都在最前）
+    assert events[0] == {
+        "type": "tool_start", "tool": "web_search", "call_id": "call_w", "input": {"query": "q"},
+    }
+    assert events[1] == {"type": "tool_start", "tool": "noop", "call_id": "call_n", "input": {}}
+    assert events[2] == {"type": "citations", "tool": "web_search", "call_id": "call_w", "items": items}
+    # tool_end 带同一个 call_id，前端据此把徽标从 running 翻成 done；duration_ms 是工具耗时
+    assert events[3] == {
+        "type": "tool_end", "tool": "web_search", "call_id": "call_w",
+        "preview": "检索「q」得到 1 条结果：[1] A",
+        "result": "检索「q」得到 1 条结果：[1] A", "duration_ms": 500,
+    }
+    assert events[4]["duration_ms"] == 1250
     body = "".join(e["text"] for e in events if e["type"] == "token")
     assert body == "据 [1] 答案是 A。", "工具原文混进正文就会落库"
+
+
+def test_each_model_start_opens_a_new_segment(monkeypatch):
+    """工具执行后模型再来一轮 = 新 segment，service 后续按它分段落库"""
+    monkeypatch.setattr(chat_manager_module, "build_model", lambda *_a, **_k: _SpyMessagesModel())
+    agent = ModelAgent("deepseek", "deepseek-chat", api_key="sk-1", tools=[])
+    agent.agent = _ReplayGraph(
+        [
+            _model_start(),
+            {"event": "on_chat_model_stream", "data": {"chunk": AIMessageChunk(content="先想调工具")}},
+            _model_end_tool_calls([{"name": "noop", "args": {}, "id": "call_1"}]),
+            _tool_end("noop", "工具结果", call_id="call_1"),
+            _model_start(),
+            {"event": "on_chat_model_stream", "data": {"chunk": AIMessageChunk(content="最终答案")}},
+        ]
+    )
+
+    async def ask():
+        return [e async for e in agent.stream([HumanMessage(content="hi")])]
+
+    events = asyncio.run(ask())
+    assert [e["type"] for e in events] == [
+        "segment_start", "token", "tool_start", "tool_end", "segment_start", "token",
+    ]
+    assert [e["segment_id"] for e in events if e["type"] == "segment_start"] == [1, 2]
 
 
 def test_citations_hint_survives_into_the_graph_input(monkeypatch):
@@ -545,6 +648,6 @@ def test_stream_emits_reasoning_as_separate_events(monkeypatch):
         return [e async for e in agent.stream([HumanMessage(content="hi")], thinking=True)]
 
     events = asyncio.run(ask())
-    assert [e["type"] for e in events] == ["reasoning", "reasoning", "token"]
+    assert [e["type"] for e in events] == ["segment_start", "reasoning", "reasoning", "token"]
     assert "".join(e["text"] for e in events if e["type"] == "reasoning") == "先想再想"
     assert "".join(e["text"] for e in events if e["type"] == "token") == "答案"

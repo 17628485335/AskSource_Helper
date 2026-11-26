@@ -47,6 +47,14 @@ class ProviderOut(BaseModel):
     is_active: bool
 
 
+class ToolOut(BaseModel):
+    """GET /settings/tools 响应元素：中文展示名 + 工具名 + lucide 图标名"""
+
+    name: str
+    label: str
+    icon: str = ""
+
+
 class ChatModelOption(BaseModel):
     """GET /settings/models 响应元素：给对话框选模型用，不携带任何密钥字段"""
 

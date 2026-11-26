@@ -79,6 +79,21 @@ def test_unauthenticated_chat_models_is_401():
     assert client.get("/settings/models").status_code == 401
 
 
+def test_tools_route_only_requires_login():
+    deps = _dependency_names(_route("/settings/tools", "GET"))
+    assert "get_current_user" in deps
+    assert "get_current_admin" not in deps, "工具列表不该只有管理员能看"
+
+
+def test_unauthenticated_tools_is_401():
+    assert client.get("/settings/tools").status_code == 401
+
+
+def test_tools_response_has_display_label():
+    schema = app.openapi()["components"]["schemas"]["ToolOut"]["properties"]
+    assert {"name", "label", "icon"} <= set(schema), schema
+
+
 def test_provider_write_strips_identifiers():
     """写入端就得去空格：表里的键必须与 ChatManager 建池用的键一致
 

@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from auth import router as auth_router
 from auth.database import AsyncSessionLocal
 
+from .agents.router import router as agents_router
 from .chat import ChatManager
 from .chat.router import router as chat_router
 from .session.router import router as session_router
@@ -44,6 +45,9 @@ app.include_router(auth_router)
 
 # 挂载设置路由（/settings/model-providers）
 app.include_router(settings_router)
+
+# 挂载 agent 路由（/agents、/agents/{id}/prompts）
+app.include_router(agents_router)
 
 # 挂载会话路由（/sessions、/sessions/{id}/messages）
 app.include_router(session_router)

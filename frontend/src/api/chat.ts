@@ -13,6 +13,14 @@ export interface ChatMetaEvent {
   platform: string
   model: string
   thinking: boolean
+  /** 当前命中的 agent 配置；缺省表示走代码默认值 */
+  agent_key?: string
+  prompt_version?: number | null
+}
+/** 分段边界：一次 on_chat_model_start 开一个 segment，后端据此分段落库 */
+export interface ChatSegmentStartEvent {
+  type: 'segment_start'
+  segment_id: number
 }
 /** 正文增量（协议 v2：原 delta 改名 token）：拼进回答正文，也进后端落库 buffer */
 export interface ChatTokenEvent {
@@ -24,17 +32,24 @@ export interface ChatReasoningEvent {
   type: 'reasoning'
   text: string
 }
-/** 工具开始执行：模型流里一出现工具名就发（早于真正执行，徽标能提前亮） */
+/** 工具开始执行：取自 on_chat_model_end 装配好的 tool_calls，带 call_id + 完整入参 */
 export interface ChatToolStartEvent {
   type: 'tool_start'
   tool: string
+  /** 模型侧 tool_call_id：前端据此把 tool_end 配到同一枚徽标（并行同名不合并） */
+  call_id: string
   input: Record<string, unknown>
 }
-/** 工具执行完成：preview 是结果摘要（后端截断），供 tooltip/展开查看 */
+/** 工具执行完成：preview 是结果摘要（后端截断），call_id 回指本次调用 */
 export interface ChatToolEndEvent {
   type: 'tool_end'
   tool: string
+  call_id: string
   preview: string
+  /** 工具的完整调用结果（落库用）；UI 展示 preview，避免把整段原文推过网络 */
+  result?: string
+  /** 工具调用耗时（毫秒）；拿不到开始时刻时为 null */
+  duration_ms: number | null
 }
 /** 一条引用：来自工具的结构化 artifact，index 就是回答正文里的 [n] */
 export interface ChatCitation {
@@ -46,10 +61,11 @@ export interface ChatCitation {
   /** search：搜索结果；page：read_url 打开过的页面 */
   kind: string
 }
-/** 工具返回的引用列表：一次工具调用一帧，与正文分开下发，后端不落库 */
+/** 工具返回的引用列表：一次工具调用一帧，与正文分开下发；后端落到 chat_tool_calls.citations_json */
 export interface ChatCitationsEvent {
   type: 'citations'
   tool: string
+  call_id: string
   items: ChatCitation[]
 }
 export interface ChatDoneEvent {
@@ -64,6 +80,7 @@ export interface ChatErrorEvent {
 
 export type ChatEvent =
   | ChatMetaEvent
+  | ChatSegmentStartEvent
   | ChatTokenEvent
   | ChatReasoningEvent
   | ChatToolStartEvent
@@ -82,6 +99,8 @@ export interface ChatPayload {
   workspace_id?: number | null
   /** 重新生成：后端先删掉本轮（末条 user 及其后续回答）再追加本次提问 */
   regenerate?: boolean
+  /** agents 表里的稳定标识；留空走默认 chat */
+  agent_key?: string | null
 }
 
 const CR = String.fromCharCode(13)

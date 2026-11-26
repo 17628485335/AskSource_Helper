@@ -71,6 +71,10 @@ class ToolSpec(BaseModel):
     # 分类与展示
     category: str = ToolCategory.CORE.value
     icon: str = DEFAULT_ICON
+    # 中文展示名：前端侧边栏等处显示，不进模型提示词
+    label: str = ""
+    # 同一轮对话内允许调用的次数；0（默认）表示不限制
+    max_calls: int = 0
     example: str = ""
     # 风险与前置条件：都只是声明，运行时的真实探测仍走 available()
     dangerous: bool = False
@@ -135,6 +139,8 @@ def register_tool(
     *,
     category: str = ToolCategory.CORE,
     icon: str = DEFAULT_ICON,
+    label: str = "",
+    max_calls: int = 0,
     tags: list[str] | None = None,
     dangerous: bool = False,
     requires_env: list[str] | None = None,
@@ -157,13 +163,15 @@ def register_tool(
                 return query
 
     装饰器的其余参数是注册侧元数据（不进实例、不发给模型）；category / tags 用于
-    分组取用，icon / example 给前端展示，dangerous / requires_env / needs_root /
-    enabled_by_default 描述风险与前置条件::
+    分组取用，label（中文展示名）/ icon / example 给前端展示，dangerous /
+    requires_env / needs_root / enabled_by_default 描述风险与前置条件::
 
         @register_tool(
             tags=["search"],
             category=ToolCategory.SEARCH,
             icon="globe",
+            label="联网搜索",
+            max_calls=3,
             requires_env=["TAVILY_API_KEY"],
             example='web_search(query="2026 年诺贝尔物理学奖")',
         )
@@ -174,7 +182,10 @@ def register_tool(
     name / description 也可以在装饰器里给：它们会被写回类的字段默认值（见
     _apply_default），所以实例与模型看到的也是新值；两边都给时以装饰器为准。
     两种写法（裸用 / 带 kwargs）都支持；name 重复会直接报错，避免静默覆盖。
+    max_calls 是同一轮对话内的调用上限，0 表示不限制；负值直接报错。
     """
+    if max_calls < 0:
+        raise ValueError("register_tool(max_calls=...) 不能为负数；0 表示不限制")
 
     def decorate(tool_cls: type[T]) -> type[T]:
         from langchain_core.tools import BaseTool
@@ -207,6 +218,8 @@ def register_tool(
             tags=tuple(str(t).strip() for t in (tags or ()) if str(t).strip()),
             category=_norm_category(category),
             icon=str(icon).strip() or DEFAULT_ICON,
+            label=str(label).strip() or resolved,
+            max_calls=max_calls,
             example=str(example).strip(),
             dangerous=dangerous,
             requires_env=tuple(str(e).strip() for e in (requires_env or ()) if str(e).strip()),

@@ -1,133 +1,110 @@
-"""Chat 端点的前后端流式通信协议：agent.astream_events(v2) → SSE 事件字典
+"""Chat 端点的流式事件协议（后端 ↔ 前端唯一契约）。
 
-协议（一轮对话的帧序列，meta/done/error 由 service 层负责，不在本模块）：
+本模块**只放事件构造函数**：把一次流式回答要下发的每种事件定型成 ev_* 工厂，
+返回的字典字段名即前端 StreamEvent 的契约。这里不掺杂任何消费 astream_events 的
+逻辑 —— 那部分（从哪个事件、取哪个字段）在 app.chat.chat_manager.ModelAgent.stream。
 
-| 事件 | 载荷 | 前端行为 | astream_events 来源 |
-|------|------|----------|---------------------|
-| token | {"text"} | 拼进回答正文（也进落库 buffer） | on_chat_model_stream 的 content 增量 |
-| reasoning | {"text"} | 渲染到可折叠「思考过程」块，不进正文不落库 | on_chat_model_stream chunk.additional_kwargs.reasoning_content |
-| tool_start | {"tool","input"} | 工具徽标置「执行中」 | 模型流里首个带该工具名的 tool_call_chunk（早于真正执行，UI 能提前亮） |
-| tool_end | {"tool","preview"} | 徽标置「完成」，preview 供展开查看 | on_tool_end |
-| citations | {"tool","items"} | 来源卡片按 index 去重累加 | on_tool_end 的 ToolMessage.artifact |
+新增事件必须三处同步更新：本文件的 ev_* + ALL_EVENT_TYPES、ModelAgent.stream、
+frontend/src/api/chat.ts（及 stores/chat.ts 的消费分支）。
 
-为什么事件从 astream(stream_mode="messages") 换成 astream_events：
-- messages 模式只给 (消息块, metadata) 二元组，工具「开始执行 / 执行完成 / 入参是什么」
-  全看不到——旧协议只能从 tool_call_chunks 播报一个名字，前端 case 'tool' 甚至接不到
-  （后端事件名是 tools），工具状态一直是坏的。astream_events 有完整的 on_tool_start /
-  on_tool_end 生命周期，run_id 还能把 start 和 end 配对。
+事件类型
+--------
+| type        | 载荷                          | 前端行为                          | astream_events 来源 |
+|-------------|-------------------------------|-----------------------------------|---------------------|
+| `segment_start` | segment_id                | 分段边界；前端忽略，后端据此分段落库 | on_chat_model_start |
+| `token`     | text                          | 拼进回答正文（也进后端落库 buffer） | on_chat_model_stream 的 content 增量 |
+| `reasoning` | text                          | 折叠「思考过程」块，不进正文不落库  | chunk.additional_kwargs.reasoning_content |
+| `tool_start`| tool, call_id, input          | 按 call_id 建工具徽标置「执行中」   | on_chat_model_end 装配好的 AIMessage.tool_calls |
+| `tool_end`  | tool, call_id, preview, result, duration_ms | 徽标按 call_id 翻「完成」，preview 供展开查看，result 是完整调用结果（落库用），duration_ms 为工具耗时 | on_tool_end |
+| `citations` | tool, call_id, items          | 来源卡片按 index 去重累加           | on_tool_end 的 ToolMessage.artifact |
+
+（meta / done / error 由 app.chat.service 编排，不经本模块。）
+
+tool_start 为什么取自 on_chat_model_end 而非模型流/on_tool_start：
+- call_id 与完整入参只在装配好的 AIMessage.tool_calls 里同时齐备（实测）；模型流里的
+  tool_call_chunks 把 args 切成 JSON 碎片、上游 index 还可能为 None，自行拼接不可靠；
+- on_tool_start 的 data 只有 input、没有 tool_call_id，并行同名调用时 input 还可能是空 {}；
+- 真正的 tool_call_id 要等到 on_tool_end 的 output.tool_call_id，故 tool_end/citations 也带
+  call_id，前端据它把「开始/结束」配到同一枚徽标（并行同名不再被按名字合并）。
+
+为什么用 astream_events 而非 astream(stream_mode="messages")：
+- messages 模式只给 (消息块, metadata) 二元组，工具「开始执行 / 结束 / 入参」全看不到，
+  旧协议只能从 tool_call_chunks 播报一个名字，前端甚至接不到（后端事件名是 tools 复数、
+  前端 case 'tool' 单数），工具状态一直是坏的；astream_events 有完整的 on_tool_start /
+  on_tool_end 生命周期。
 - context kwarg 实测原样到达图中间件（request.runtime.context），
   「一份图服务两种思考态」的 select_thinking 切换不受影响。
-
-注意事项（都有实测依据，改之前先重跑探针）：
-- reasoning_content 不是 langchain 标准字段，靠 settings.llm.ReasoningChatOpenAI 覆写
-  _convert_chunk_to_generation_chunk 挂进 additional_kwargs 才会出现在 stream 事件的 chunk 上；
-  换上游适配器时那一层不能丢。
-- on_chat_model_end 带整段聚合消息，正文已逐块流过，不能再重发，否则 done 里全文翻倍。
-- 引用工具与协议解耦：只有 web_search / read_url 这类工具才带 artifact，
-  普通工具返回 str 时 preview 直接取 str，不产生 citations 帧。
 """
 
-from collections.abc import AsyncIterator, Sequence
-from typing import Any
+from __future__ import annotations
 
-from langchain_core.messages import AIMessageChunk, BaseMessage, ToolMessage
+from typing import Any, Literal
 
-from app.tools.citations import extract_citations
+# 事件类型字面量：与 ModelAgent.stream 产出的 type 一一对应
+EventType = Literal[
+    "segment_start", "token", "reasoning", "tool_start", "tool_end", "citations"
+]
 
 # 事件名清单：service / router / 前端据此对齐，新增事件先加这里
-EVENT_TYPES = ("token", "reasoning", "tool_start", "tool_end", "citations")
-
-# tool_end.preview 的截断长度：够前端 tooltip/展开区用，又不会把整页搜索原文推过网络
-PREVIEW_CHARS = 400
-
-
-def _text_of(content: Any) -> str:
-    """消息 content 容错取值：str 或分块 list（推理模型的多模态形状）"""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                parts.append(block.get("text") or "")
-        return "".join(parts)
-    return ""
+ALL_EVENT_TYPES: tuple[str, ...] = (
+    "segment_start",
+    "token",
+    "reasoning",
+    "tool_start",
+    "tool_end",
+    "citations",
+)
 
 
-def _preview_of(output: Any) -> str:
-    """工具结果的展示摘要：ToolMessage 取 content，dict 取字符串化，其余 str 兜底"""
-    if isinstance(output, BaseMessage):
-        text = _text_of(output.content)
-    elif isinstance(output, dict):
-        for value in output.values():
-            if isinstance(value, ToolMessage):
-                text = _text_of(value.content)
-                break
-        else:
-            text = str(output)
-    else:
-        text = str(output)
-    text = text.strip()
-    return text[:PREVIEW_CHARS]
+def ev_segment_start(segment_id: int) -> dict[str, Any]:
+    """构造 segment_start 事件：一次新的模型调用开始，后续 token/tool 事件属于该段。"""
+    return {"type": "segment_start", "segment_id": segment_id}
 
 
-async def translate(
-    agent: Any,
-    messages: Sequence[Any],
-    *,
-    context: dict[str, Any] | None = None,
-) -> AsyncIterator[dict[str, Any]]:
-    """把 create_agent 图的 astream_events(v2) 逐个翻译成协议事件字典。
+def ev_token(text: str) -> dict[str, Any]:
+    """构造 token 事件：推送模型回答正文的一个增量片段（后端也据此累加落库）。"""
+    return {"type": "token", "text": text}
 
-    只管翻译：不碰数据库、不发 meta/done/error（那三个是 service 的编排职责），
-    异常原样抛出，由调用方转成 error 事件。
 
-    announced（已播报的工具名）必须是生成器局部状态：同一个 ModelAgent 实例会被
-    并发请求复用，挂到 self 上会让后一个请求看不到前一个请求播报过的工具名。
+def ev_reasoning(text: str) -> dict[str, Any]:
+    """构造 reasoning 事件：推送深度档的思考增量，前端收进折叠块，不进正文也不落库。"""
+    return {"type": "reasoning", "text": text}
+
+
+def ev_tool_start(tool: str, call_id: str = "", tool_input: Any = None) -> dict[str, Any]:
+    """构造 tool_start 事件：工具开始执行。
+
+    call_id 是模型侧的 tool_call_id（前端据此把 tool_end 配到同一枚徽标）；
+    tool_input 是装配好的完整入参 dict。个别上游不返回 id 时 call_id 为空串，
+    前端退化到按工具名匹配。
     """
-    announced: set[str] = set()
-    async for ev in agent.astream_events(
-        {"messages": list(messages)}, version="v2", context=context or {}
-    ):
-        kind = ev["event"]
+    return {"type": "tool_start", "tool": tool, "call_id": call_id, "input": tool_input or {}}
 
-        if kind == "on_chat_model_stream":
-            chunk = (ev.get("data") or {}).get("chunk")
-            if not isinstance(chunk, AIMessageChunk):
-                continue
-            # 思考增量：由 settings.llm.ReasoningChatOpenAI 从 delta 里接住，父类会直接丢掉
-            reasoning = (chunk.additional_kwargs or {}).get("reasoning_content")
-            if isinstance(reasoning, str) and reasoning:
-                yield {"type": "reasoning", "text": reasoning}
-            # 工具名在模型流里一出现就播报，不等 on_tool_start：ReAct 从决定调用到
-            # 工具真正跑起来之间还有一段静默，UI 提前亮徽标才不会像卡死
-            for call in getattr(chunk, "tool_call_chunks", None) or []:
-                name = call.get("name") if isinstance(call, dict) else None
-                if name and name not in announced:
-                    announced.add(name)
-                    yield {"type": "tool_start", "tool": name, "input": {}}
-            text = _text_of(chunk.content)
-            if text:
-                yield {"type": "token", "text": text}
 
-        elif kind == "on_tool_start":
-            # 兜底：若模型流里没露出工具名（个别上游 tool_call_chunks 不带 name），
-            # 执行开始事件是唯一能报名字的时机；已播报过的不重发
-            name = ev.get("name") or ""
-            if name and name not in announced:
-                announced.add(name)
-                data = ev.get("data") or {}
-                yield {"type": "tool_start", "tool": name, "input": data.get("input") or {}}
+def ev_tool_end(
+    tool: str,
+    preview: str,
+    call_id: str = "",
+    duration_ms: int | None = None,
+    result: str = "",
+) -> dict[str, Any]:
+    """构造 tool_end 事件：工具执行结束，preview 是截断后的展示摘要，result 是完整调用结果。
 
-        elif kind == "on_tool_end":
-            name = ev.get("name") or ""
-            output = (ev.get("data") or {}).get("output")
-            # 引用来自 ToolMessage.artifact：工具的旁路结构化数据，不会发给模型。
-            # 必须先于 tool_end 发，前端收到徽标「完成」时来源卡片已在路上
-            if isinstance(output, ToolMessage):
-                items = extract_citations(output)
-                if items:
-                    yield {"type": "citations", "tool": name, "items": items}
-            yield {"type": "tool_end", "tool": name, "preview": _preview_of(output)}
+    call_id 回指本次调用；duration_ms 是工具调用耗时（毫秒），拿不到开始时刻时为 None。
+    result 供 service 按 segment 落库，前端展示仍用 preview，不把整段搜索原文推过网络。
+    """
+    return {
+        "type": "tool_end",
+        "tool": tool,
+        "call_id": call_id,
+        "preview": preview,
+        "result": result,
+        "duration_ms": duration_ms,
+    }
+
+
+def ev_citations(
+    tool: str, items: list[dict[str, Any]], call_id: str = ""
+) -> dict[str, Any]:
+    """构造 citations 事件：工具返回的结构化引用，items[].index 与正文里的 [n] 同号。"""
+    return {"type": "citations", "tool": tool, "call_id": call_id, "items": items}

@@ -9,15 +9,21 @@ import { computed, ref } from 'vue'
 import { streamChat, type ChatCitation, type ChatEvent, type ChatPayload } from '../api/chat'
 import { listSessionMessages } from '../api/session'
 
+/** 一次工具调用（协议 v2 按 call_id 跟踪）：并行同名调用各自一条 */
+export interface ToolCall {
+  /** 模型侧 tool_call_id；个别上游不返回时为空，配对退化到按 name */
+  callId: string
+  name: string
+  input: Record<string, unknown>
+  state: 'running' | 'done'
+}
+
 export interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
-  /** 本轮调用过的工具名（按出现顺序去重） */
-  tools: string[]
-  /** 工具执行状态（协议 v2 的 tool_start/tool_end）：running 等结束帧翻成 done；
-   * 历史恢复时为空，此时徽标不区分状态 */
-  toolStates: Record<string, 'running' | 'done'>
-  /** 本轮工具返回的来源列表（按 [n] 编号升序）；后端不落库，重进会话为空 */
+  /** 本轮的工具调用（按出现顺序，以 call_id 去重）：徽标据此逐个渲染 */
+  toolCalls: ToolCall[]
+  /** 本轮工具返回的来源列表（按 [n] 编号升序）；历史会话从 tool_calls.citations_json 重建 */
   citations: ChatCitation[]
   /** 助手气泡是否还在接收增量 */
   streaming: boolean
@@ -31,13 +37,19 @@ export interface ChatMessage {
   created_at: string
 }
 
-type Options = Pick<ChatPayload, 'platform' | 'model' | 'thinking' | 'workspace_id' | 'regenerate'>
+type Options = Pick<
+  ChatPayload,
+  'platform' | 'model' | 'thinking' | 'workspace_id' | 'regenerate' | 'agent_key'
+>
 
 const messages = ref<ChatMessage[]>([])
 const busy = ref(false)
 const sessionId = ref<number | null>(null)
 /** meta 事件带回的模型标识，用于在会话顶部展示 */
 const modelLabel = ref('')
+/** meta 事件带回的 agent 与提示词版本，用于会话详情展示 */
+const agentKey = ref('')
+const promptVersion = ref<number | null>(null)
 /** 本轮请求发起时刻（0 = 空闲），供 UI 计算已等待秒数 */
 const startedAt = ref(0)
 
@@ -54,8 +66,7 @@ function newMessage(
   return {
     role,
     content,
-    tools: [],
-    toolStates: {},
+    toolCalls: [],
     citations: [],
     streaming: false,
     error: '',
@@ -72,6 +83,11 @@ function applyEvent(event: ChatEvent, bubble: ChatMessage) {
       // 档位以服务端回写为准：模型不支持时后端会按快速发，本地选择只是意向
       bubble.thinking = event.thinking
       modelLabel.value = `${event.platform} / ${event.model}${event.thinking ? ' · 深度' : ''}`
+      agentKey.value = event.agent_key ?? ''
+      promptVersion.value = event.prompt_version ?? null
+      break
+    case 'segment_start':
+      // 后端分段落库用的边界；前端仍用一个气泡展示整轮回答，这里无需改状态
       break
     case 'token':
       bubble.content += event.text
@@ -79,17 +95,33 @@ function applyEvent(event: ChatEvent, bubble: ChatMessage) {
     case 'reasoning':
       bubble.reasoning += event.text
       break
-    case 'tool_start':
-      if (!bubble.tools.includes(event.tool)) {
-        bubble.tools.push(event.tool)
-        bubble.toolStates[event.tool] = 'running'
+    case 'tool_start': {
+      // 以 call_id 为主键（并行同名才能各亮一枚），个别上游无 id 时回退工具名
+      const key = event.call_id || event.tool
+      if (!bubble.toolCalls.some((c) => (c.callId || c.name) === key)) {
+        bubble.toolCalls.push({
+          callId: event.call_id,
+          name: event.tool,
+          input: event.input,
+          state: 'running',
+        })
       }
       break
-    case 'tool_end':
-      // 乱序容错：没收到 start（理论上不会）也补进列表再翻状态
-      if (!bubble.tools.includes(event.tool)) bubble.tools.push(event.tool)
-      bubble.toolStates[event.tool] = 'done'
+    }
+    case 'tool_end': {
+      // 乱序容错：没收到 start（理论上不会）也补一条再翻状态
+      const key = event.call_id || event.tool
+      const call = bubble.toolCalls.find((c) => (c.callId || c.name) === key)
+      if (call) call.state = 'done'
+      else
+        bubble.toolCalls.push({
+          callId: event.call_id,
+          name: event.tool,
+          input: {},
+          state: 'done',
+        })
       break
+    }
     case 'citations':
       // 一次工具调用一帧，多轮搜索累加；编号由后端从本轮已用号后续，所以按 index 去重而不是 url
       // （同一个地址被搜到一次、又被 read_url 打开一次时，两条正文不同、[n] 也不同）
@@ -155,7 +187,30 @@ async function loadSession(
   const rows = await listSessionMessages(id)
   messages.value = rows
     .filter((r) => r.role === 'user' || r.role === 'assistant')
-    .map((r) => newMessage(r.role as 'user' | 'assistant', r.content, r.created_at))
+    .map((r) => {
+      const msg = newMessage(r.role as 'user' | 'assistant', r.content, r.created_at)
+      if (r.role === 'assistant') {
+        // 历史会话的引用来自 chat_tool_calls.citations_json；按 [n] 去重，与实时流一致
+        const seen = new Set<number>()
+        for (const tc of r.tool_calls ?? []) {
+          for (const raw of tc.citations_json ?? []) {
+            const item = raw as Partial<ChatCitation>
+            if (typeof item.index !== 'number' || seen.has(item.index)) continue
+            seen.add(item.index)
+            msg.citations.push({
+              index: item.index,
+              title: typeof item.title === 'string' ? item.title : '',
+              url: typeof item.url === 'string' ? item.url : '',
+              snippet: typeof item.snippet === 'string' ? item.snippet : '',
+              published_date: typeof item.published_date === 'string' ? item.published_date : '',
+              kind: typeof item.kind === 'string' ? item.kind : '',
+            })
+          }
+        }
+        msg.citations.sort((a, b) => a.index - b.index)
+      }
+      return msg
+    })
   sessionId.value = id
   modelLabel.value = meta?.platform
     ? `${meta.platform} / ${meta.model}${meta.thinking ? ' · 深度' : ''}`
@@ -169,6 +224,8 @@ function reset() {
   messages.value = []
   sessionId.value = null
   modelLabel.value = ''
+  agentKey.value = ''
+  promptVersion.value = null
   startedAt.value = 0
 }
 
@@ -178,6 +235,8 @@ export function useChat() {
     busy,
     sessionId,
     modelLabel,
+    agentKey,
+    promptVersion,
     startedAt,
     hasConversation,
     send,

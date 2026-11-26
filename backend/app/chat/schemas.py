@@ -25,8 +25,13 @@ class ChatRequest(BaseModel):
         default=False,
         description="编辑末条提问后重新生成：先删除本轮（末条 user 及其后续）再追加新提问",
     )
+    agent_key: str | None = Field(
+        default=None,
+        max_length=64,
+        description="agents 表里的稳定标识；留空走默认 chat，配置缺失时回退代码默认值",
+    )
 
-    @field_validator("platform", "model", mode="before")
+    @field_validator("platform", "model", "agent_key", mode="before")
     @classmethod
     def _strip(cls, value: object) -> object:
         """模型定位字段去空格：库里存有旧脏数据时，前端原样回传的名字也能命中池里的键"""
