@@ -1,7 +1,9 @@
-"""Agent 定义与提示词版本模块：ORM / 管理接口 / 请求解析服务"""
+"""Agent 定义与提示词版本模块：ORM / 管理接口 / 请求解析服务。
+
+router 由 app.main 从 .agents.router 显式挂载，包初始化只导出模型与服务。
+"""
 
 from .models import Agent, AgentPrompt
-from .router import router
 from .schemas import (
     AgentCreate,
     AgentOut,
@@ -51,5 +53,4 @@ __all__ = [
     "create_prompt",
     "activate_prompt",
     "resolve_agent",
-    "router",
 ]

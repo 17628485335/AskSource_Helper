@@ -8,6 +8,7 @@ import { useChat } from '../stores/chat'
 import { useLlm } from '../stores/llm'
 import { useUi } from '../stores/ui'
 import { useWorkspace } from '../stores/workspace'
+import { formatDateTime, formatDay } from '../utils/format'
 
 /** 侧边栏折叠状态：宽度由父容器控制，此处负责内容收放 */
 const collapsed = defineModel<boolean>('collapsed', { required: true })
@@ -98,23 +99,6 @@ async function openSession(s: {
   } finally {
     openingId.value = null
   }
-}
-
-function formatDay(iso: string): string {
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return ''
-  const today = new Date()
-  const sameYear = d.getFullYear() === today.getFullYear()
-  const md = `${d.getMonth() + 1}月${d.getDate()}日`
-  return sameYear ? md : `${d.getFullYear()}年${md}`
-}
-
-/** 悬停时展示的精确时间：完整到秒（年-月-日 时:分:秒） */
-function formatTime(iso: string): string {
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return ''
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
 function onDocMousedown(e: MouseEvent) {
@@ -552,7 +536,7 @@ watch(isLoggedIn, (v) => {
           </div>
           <!-- 悬停时下方展开精确时间 -->
           <p class="overflow-hidden max-h-0 opacity-0 group-hover:max-h-5 group-hover:opacity-100 group-hover:mt-1 transition-all duration-200 pl-[21px] text-[10.5px] leading-none text-[#8a8872]">
-            最后活跃 · {{ formatTime(s.updated_at) }}
+            最后活跃 · {{ formatDateTime(s.updated_at) }}
           </p>
         </button>
 

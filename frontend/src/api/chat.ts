@@ -6,6 +6,7 @@
  */
 
 import { ApiError, ensureFreshToken, forceRefreshToken, getToken } from './auth'
+import { NETWORK_ERROR_MESSAGE } from '../constants/messages'
 
 export interface ChatMetaEvent {
   type: 'meta'
@@ -68,6 +69,16 @@ export interface ChatCitationsEvent {
   call_id: string
   items: ChatCitation[]
 }
+/** 一次模型调用的 token 用量（来自上游 usage_metadata） */
+export interface ChatUsageEvent {
+  type: 'usage'
+  segment_id: number
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  input_token_details: Record<string, number>
+  output_token_details: Record<string, number>
+}
 export interface ChatDoneEvent {
   type: 'done'
   session_id: number
@@ -86,6 +97,7 @@ export type ChatEvent =
   | ChatToolStartEvent
   | ChatToolEndEvent
   | ChatCitationsEvent
+  | ChatUsageEvent
   | ChatDoneEvent
   | ChatErrorEvent
 
@@ -172,7 +184,7 @@ export async function streamChat(
       })
     } catch (e) {
       if (isAbort(e)) throw e
-      throw new ApiError(0, '无法连接服务器，请确认后端已启动')
+      throw new ApiError(0, NETWORK_ERROR_MESSAGE)
     }
   }
 

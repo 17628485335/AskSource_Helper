@@ -279,14 +279,14 @@ agent_key = memory_compressor
 
 ## 7. Phase 3：接入 chat 请求链路
 
-当前 `backend/app/chat/service.py` 中通过 `session_service.load_history()` 取历史，后续改为压缩感知的历史加载。
+当前 `backend/app/chat/service.py` 中通过 `app.context.history.load_history()` 取历史，后续改为压缩感知的历史加载。
 
 ### 改造
 
 把：
 
 ```python
-history = await session_service.load_history(db, sid)
+history = await load_history(db, sid)
 ```
 
 改成：

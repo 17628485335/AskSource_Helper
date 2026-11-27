@@ -1,9 +1,15 @@
-"""上下文段模块：agent 绑定 / agent 文档 / 用户文档 / 装配器"""
+"""上下文段模块：agent 绑定 / agent 文档 / 用户文档 / 能力快照 / 对话历史组装。
 
-from .assembler import ContextBundle, build_context, build_skills_snapshot, estimate_tokens
-from .generator import GENERATABLE_KINDS, generate_context_content
+router 不由包初始化导出：app.context 会被 chat / session 等模块导入，
+在 __init__ 里加载 router 会把 chat.chat_manager 一起拖进来形成导入环。
+路由统一由 app.main 显式从 .context.router 挂载。
+"""
+
+from .assembler import build_skills_snapshot
+from .generator import generate_context_content
+from .history import load_history, load_history_with_tools, wrap_history
+from .history_compactor import compact_history
 from .models import AgentContextBinding, AgentContextDoc, AgentMemory, UserContextDoc
-from .router import router
 from .schemas import (
     AgentContextBindingCreate,
     AgentContextBindingOut,
@@ -15,6 +21,8 @@ from .schemas import (
     UserContextDocOut,
     UserContextDocUpdate,
 )
+from .token_counter import count_context_tokens, estimate_message_tokens, estimate_text_tokens
+from .usage import get_context_usage
 from .service import (
     ContextConflict,
     ContextNotFound,
@@ -39,12 +47,13 @@ __all__ = [
     "AgentContextBinding",
     "AgentContextDoc",
     "UserContextDoc",
-    "ContextBundle",
-    "build_context",
     "build_skills_snapshot",
-    "estimate_tokens",
+    "compact_history",
+    "load_history",
+    "load_history_with_tools",
+    "wrap_history",
     "generate_context_content",
-    "GENERATABLE_KINDS",
+    "get_context_usage",
     "AgentContextBindingCreate",
     "AgentContextBindingOut",
     "AgentContextBindingUpdate",
@@ -71,5 +80,7 @@ __all__ = [
     "update_user_doc",
     "delete_user_doc",
     "find_user_doc",
-    "router",
+    "count_context_tokens",
+    "estimate_message_tokens",
+    "estimate_text_tokens",
 ]

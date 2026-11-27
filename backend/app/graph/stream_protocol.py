@@ -4,7 +4,7 @@
 返回的字典字段名即前端 StreamEvent 的契约。这里不掺杂任何消费 astream_events 的
 逻辑 —— 那部分（从哪个事件、取哪个字段）在 app.chat.chat_manager.ModelAgent.stream。
 
-新增事件必须三处同步更新：本文件的 ev_* + ALL_EVENT_TYPES、ModelAgent.stream、
+新增事件必须三处同步更新：本文件的 ev_*、ModelAgent.stream、
 frontend/src/api/chat.ts（及 stores/chat.ts 的消费分支）。
 
 事件类型
@@ -17,6 +17,7 @@ frontend/src/api/chat.ts（及 stores/chat.ts 的消费分支）。
 | `tool_start`| tool, call_id, input          | 按 call_id 建工具徽标置「执行中」   | on_chat_model_end 装配好的 AIMessage.tool_calls |
 | `tool_end`  | tool, call_id, preview, result, duration_ms | 徽标按 call_id 翻「完成」，preview 供展开查看，result 是完整调用结果（落库用），duration_ms 为工具耗时 | on_tool_end |
 | `citations` | tool, call_id, items          | 来源卡片按 index 去重累加           | on_tool_end 的 ToolMessage.artifact |
+| `usage`     | segment_id, input_tokens, output_tokens, total_tokens, input_token_details, output_token_details | 本段模型调用的 token 用量，后端汇总落 chat_turn | on_chat_model_end 的 AIMessage.usage_metadata |
 
 （meta / done / error 由 app.chat.service 编排，不经本模块。）
 
@@ -38,22 +39,7 @@ tool_start 为什么取自 on_chat_model_end 而非模型流/on_tool_start：
 
 from __future__ import annotations
 
-from typing import Any, Literal
-
-# 事件类型字面量：与 ModelAgent.stream 产出的 type 一一对应
-EventType = Literal[
-    "segment_start", "token", "reasoning", "tool_start", "tool_end", "citations"
-]
-
-# 事件名清单：service / router / 前端据此对齐，新增事件先加这里
-ALL_EVENT_TYPES: tuple[str, ...] = (
-    "segment_start",
-    "token",
-    "reasoning",
-    "tool_start",
-    "tool_end",
-    "citations",
-)
+from typing import Any
 
 
 def ev_segment_start(segment_id: int) -> dict[str, Any]:
@@ -108,3 +94,20 @@ def ev_citations(
 ) -> dict[str, Any]:
     """构造 citations 事件：工具返回的结构化引用，items[].index 与正文里的 [n] 同号。"""
     return {"type": "citations", "tool": tool, "call_id": call_id, "items": items}
+
+
+def ev_usage(usage: dict[str, Any], *, segment_id: int) -> dict[str, Any]:
+    """构造 usage 事件：一次模型调用的 token 用量，原样带上细分字段。
+
+    usage 来自 AIMessage.usage_metadata，可能含 input_token_details /
+    output_token_details（cache_read、reasoning 等）；上游没返回细分时缺省为空 dict。
+    """
+    return {
+        "type": "usage",
+        "segment_id": segment_id,
+        "input_tokens": usage.get("input_tokens") or 0,
+        "output_tokens": usage.get("output_tokens") or 0,
+        "total_tokens": usage.get("total_tokens") or 0,
+        "input_token_details": usage.get("input_token_details") or {},
+        "output_token_details": usage.get("output_token_details") or {},
+    }

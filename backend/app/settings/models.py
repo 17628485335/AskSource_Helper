@@ -6,7 +6,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from auth.database import Base
@@ -26,6 +26,8 @@ class LlmProvider(Base):
     base_url: Mapped[str] = mapped_column(String(512), default="")
     api_key: Mapped[str] = mapped_column(String(512), default="")
     default_model: Mapped[str] = mapped_column(String(128), default="")
+    # 模型上下文窗口（token），用于裁剪送进模型的对话历史
+    context_size: Mapped[int] = mapped_column(Integer, default=32768)
     supports_thinking: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

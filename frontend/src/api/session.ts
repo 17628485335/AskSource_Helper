@@ -39,6 +39,16 @@ export interface ToolCallDto {
   citations_json?: Array<Record<string, unknown>> | null
 }
 
+/** 消息所属轮次的 token 用量（来自 chat_turns） */
+export interface TurnUsageDto {
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  input_token_details: Record<string, number>
+  output_token_details: Record<string, number>
+  model_calls: number
+}
+
 /** 与后端 MessageOut 对齐（role 含 user/assistant/system/tools） */
 export interface SessionMessageDto {
   id: number
@@ -50,6 +60,19 @@ export interface SessionMessageDto {
   created_at: string
   turn_id?: number | null
   tool_calls?: ToolCallDto[]
+  turn_usage?: TurnUsageDto | null
+}
+
+/** 与后端 ContextUsageOut 对齐 */
+export interface ContextUsageDto {
+  used_tokens: number
+  context_size: number
+  remaining_tokens: number
+  usage_ratio: number
+  message_count: number
+  summary_chars: number
+  /** used_tokens 的来源：api=上游真实 usage，estimated=tiktoken 估算 */
+  source: string
 }
 
 export interface SessionPageDto {
@@ -84,4 +107,12 @@ export function listSessionMessages(
   return request<SessionMessageDto[]>(`/sessions/${sessionId}/messages?limit=${limit}`, {
     withAuth: true,
   })
+}
+
+/** 查询会话上下文用量；contextSize 由当前选中模型提供 */
+export function getContextUsage(sessionId: number, contextSize: number): Promise<ContextUsageDto> {
+  return request<ContextUsageDto>(
+    `/sessions/${sessionId}/context-usage?context_size=${contextSize}`,
+    { withAuth: true },
+  )
 }

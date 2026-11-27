@@ -117,7 +117,6 @@ class ContextGenerateResponse(BaseModel):
 class SystemPromptComposeRequest(BaseModel):
     prompt: str = Field(max_length=20000)
     agent_id: int | None = Field(default=None, ge=1)
-    tool_names: list[str] | None = None
 
 
 class SystemPromptComposeResponse(BaseModel):

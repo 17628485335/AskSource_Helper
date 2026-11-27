@@ -8,6 +8,8 @@
  * 走手工 fetch 的流式接口（/chat）不进第 2 条链路，靠第 1 条 + 发送前 ensureFreshToken 兜住。
  */
 
+import { NETWORK_ERROR_MESSAGE } from '../constants/messages'
+
 export interface User {
   id: number
   username: string
@@ -78,7 +80,7 @@ async function rawFetch(path: string, options: RequestInit = {}): Promise<Respon
       headers,
     })
   } catch {
-    throw new ApiError(0, '无法连接服务器，请确认后端已启动')
+    throw new ApiError(0, NETWORK_ERROR_MESSAGE)
   }
 }
 

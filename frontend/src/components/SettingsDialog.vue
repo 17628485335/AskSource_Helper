@@ -1,8 +1,16 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue'
-import { useLlm, PLATFORM_PRESET, type LlmProviderConfig } from '../stores/llm'
+import {
+  useLlm,
+  PLATFORM_PRESET,
+  CONTEXT_SIZES,
+  DEFAULT_CONTEXT_SIZE,
+  normalizeContextSize,
+  type LlmProviderConfig,
+} from '../stores/llm'
 import { useAuth } from '../stores/auth'
 import * as authApi from '../api/auth'
+import { useTheme, type ThemeMode } from '../stores/theme'
 import { useModels } from '../stores/models'
 import {
   activateAgentPrompt,
@@ -44,6 +52,12 @@ const open = defineModel<boolean>({ required: true })
 
 const { providers, activeId, addProvider, updateProvider, removeProvider, setActive, saveAll, saving, load, loading: loadingLlm, loadError, saveError: lastSaveError } = useLlm()
 const { user, isLoggedIn, isAdmin, logout, setUser } = useAuth()
+const { mode: themeMode, setMode: setThemeMode } = useTheme()
+const themeOptions: { value: ThemeMode; label: string }[] = [
+  { value: 'light', label: '浅色' },
+  { value: 'dark', label: '深色' },
+  { value: 'system', label: '跟随系统' },
+]
 // 保存成功后作废对话框模型列表的缓存，让刚接入的模型立刻可选
 const { load: loadModels } = useModels()
 // 保存 agent 配置后立刻刷新对话区可选列表
@@ -89,6 +103,7 @@ const displayName = ref('')
 /** 显示名称留空时保存被拦下的标记（打开表单不立刻标红，点了保存才提示） */
 const nameError = ref(false)
 const supportsThinking = ref(true)
+const contextSize = ref(DEFAULT_CONTEXT_SIZE)
 
 /* ---------------- Agent 管理 ---------------- */
 const adminAgents = ref<AgentDto[]>([])
@@ -530,14 +545,9 @@ async function generateSystemPrompt() {
   systemPromptGenerating.value = true
   systemPromptError.value = ''
   try {
-    const selectedTools =
-      agToolMode.value === 'picked'
-        ? agToolNames.value
-        : agentTools.value.map((t) => t.name)
     const result = await composeSystemPrompt({
       prompt: agPrompt.value,
       agent_id: agentEditingId.value,
-      tool_names: selectedTools,
     })
     agPrompt.value = result.content
     agentSaved.value = ''
@@ -548,17 +558,29 @@ async function generateSystemPrompt() {
   }
 }
 
+/** 去除空行后比较：只增删空行不算内容变化，避免无意义地重建 system_prompt */
+function sameContentIgnoringBlankLines(a: string, b: string): boolean {
+  const strip = (s: string) =>
+    (s || '')
+      .split(/\r?\n/)
+      .filter((line) => line.trim() !== '')
+      .join('\n')
+  return strip(a) === strip(b)
+}
+
+/** 分段相对已落库文档是否有实质内容变化；新增空白分段返回 false */
+function draftHasMeaningfulChange(draft: ContextDraft): boolean {
+  if (draft.resolver !== 'agent_doc') return true
+  const doc = agentContextDocs.value.find((d) => d.id === draft.docId)
+  return !sameContentIgnoringBlankLines(doc?.content ?? '', draft.content)
+}
+
 /** 上下文保存后重新生成提示词并落库，保证 agent_prompts.hash 与上下文同步 */
 async function regenerateAndSavePrompt(agentId: number, note: string) {
   try {
-    const selectedTools =
-      agToolMode.value === 'picked'
-        ? agToolNames.value
-        : agentTools.value.map((t) => t.name)
     const result = await composeSystemPrompt({
       prompt: agPrompt.value,
       agent_id: agentId,
-      tool_names: selectedTools,
     })
     agPrompt.value = result.content
     await createAgentPrompt(agentId, {
@@ -641,39 +663,78 @@ function onOrderDragEnd() {
   orderDropIndex.value = null
 }
 
-async function addMemoryDraft() {
-  if (agentEditingId.value === null) return
+/** 本地草稿用负 id 标识，失焦有内容时再落库 */
+let memoryDraftSeq = 0
+
+function addMemoryDraft() {
+  const agentId = agentEditingId.value
+  if (agentId === null) return
   contextGenerateError.value = ''
-  try {
-    const created = await createAgentMemory(agentEditingId.value, '')
-    memoryDrafts.value.push(created)
-    contextSaved.value.memory = '已新增空白记忆'
-    void regenerateAndSavePrompt(agentEditingId.value, '记忆变更后自动生成')
-  } catch (e) {
-    contextGenerateError.value = e instanceof Error ? e.message : '新增记忆失败'
-  }
+  memoryDrafts.value.push({
+    id: --memoryDraftSeq,
+    agent_id: agentId,
+    content: '',
+    enabled: true,
+    created_at: '',
+    updated_at: '',
+  })
 }
 
 async function updateMemoryContent(memory: AgentMemoryDto, content: string) {
-  if (agentEditingId.value === null) return
+  const agentId = agentEditingId.value
+  if (agentId === null) return
   contextGenerateError.value = ''
+  const index = memoryDrafts.value.findIndex((m) => m.id === memory.id)
+  if (index < 0) return
+
+  const meaningful = !sameContentIgnoringBlankLines(memory.content, content)
+  if (!content.trim()) {
+    // 失焦仍为空：本地草稿直接丢弃，已落库的清空内容
+    if (memory.id < 0) {
+      memoryDrafts.value.splice(index, 1)
+    } else {
+      try {
+        const updated = await updateAgentMemory(agentId, memory.id, { content })
+        memoryDrafts.value[index] = updated
+      } catch (e) {
+        contextGenerateError.value = e instanceof Error ? e.message : '保存记忆失败'
+      }
+    }
+    return
+  }
+
   try {
-    const updated = await updateAgentMemory(agentEditingId.value, memory.id, { content })
-    const index = memoryDrafts.value.findIndex((m) => m.id === memory.id)
-    if (index >= 0) memoryDrafts.value[index] = updated
-    void regenerateAndSavePrompt(agentEditingId.value, '记忆内容变更后自动生成')
+    const updated =
+      memory.id < 0
+        ? await createAgentMemory(agentId, content)
+        : await updateAgentMemory(agentId, memory.id, { content })
+    memoryDrafts.value[index] = updated
+    // 只增删空行不算实质变化
+    if (meaningful) {
+      void regenerateAndSavePrompt(agentId, '记忆内容变更后自动生成')
+    }
   } catch (e) {
     contextGenerateError.value = e instanceof Error ? e.message : '保存记忆失败'
   }
 }
 
 async function removeMemoryDraft(memory: AgentMemoryDto) {
-  if (agentEditingId.value === null) return
+  const agentId = agentEditingId.value
+  if (agentId === null) return
   contextGenerateError.value = ''
+  const index = memoryDrafts.value.findIndex((m) => m.id === memory.id)
+  if (index < 0) return
+
   try {
-    await deleteAgentMemory(agentEditingId.value, memory.id)
-    memoryDrafts.value = memoryDrafts.value.filter((m) => m.id !== memory.id)
-    void regenerateAndSavePrompt(agentEditingId.value, '记忆删除后自动生成')
+    // 本地草稿未落库，直接移除；空白记忆也不触发重建
+    const meaningful = !!memory.content.trim()
+    if (memory.id >= 0) {
+      await deleteAgentMemory(agentId, memory.id)
+    }
+    memoryDrafts.value.splice(index, 1)
+    if (meaningful) {
+      void regenerateAndSavePrompt(agentId, '记忆删除后自动生成')
+    }
   } catch (e) {
     contextGenerateError.value = e instanceof Error ? e.message : '删除记忆失败'
   }
@@ -687,9 +748,13 @@ async function saveContextGroup(groupKey: 'agent' | 'user' | 'memory') {
   contextSaved.value[groupKey] = ''
   contextGenerateError.value = ''
   try {
+    // 全部是空白分段时跳过重建，避免新增空分段就发布新版本
+    const meaningful = drafts.some((d) => draftHasMeaningfulChange(d))
     await saveAgentContexts(agentEditingId.value, drafts)
     contextSaved.value[groupKey] = '已保存'
-    await regenerateAndSavePrompt(agentEditingId.value, '上下文保存后自动生成')
+    if (meaningful) {
+      await regenerateAndSavePrompt(agentEditingId.value, '上下文保存后自动生成')
+    }
   } catch (e) {
     contextGenerateError.value = e instanceof Error ? e.message : '保存上下文失败'
   } finally {
@@ -779,6 +844,7 @@ async function editAgent(agent: AgentDto) {
   agentSaved.value = ''
   agentError.value = ''
   agentFormOpen.value = true
+  pushView()
   await loadAgentPrompts(agent.id)
   const active = adminPrompts.value.find((p) => p.version === agent.active_prompt_version)
   agPrompt.value = active?.system_prompt ?? ''
@@ -835,15 +901,17 @@ async function saveAgent() {
   }
 }
 
-async function removeAgent() {
-  if (agentEditingId.value === null) return
-  const target = adminAgents.value.find((a) => a.id === agentEditingId.value)
+async function removeAgent(agentId: number | null = agentEditingId.value) {
+  if (agentId === null) return
+  const target = adminAgents.value.find((a) => a.id === agentId)
   if (!target || !window.confirm(`确认删除 Agent「${target.name || target.agent_key}」？`)) return
   agentError.value = ''
   try {
     await deleteAgent(target.id)
-    resetAgentForm()
-    agentFormOpen.value = false
+    if (agentFormOpen.value) {
+      resetAgentForm()
+      goBack()
+    }
     await loadAdminAgentData()
     void loadChatAgents(true)
   } catch (e) {
@@ -873,6 +941,9 @@ watch(nav, (value) => {
   if (value === 'model') {
     // 切回模型页时回到列表视图；表单只在点「新增/编辑」后出现
     formOpen.value = false
+    // 模型配置只在登录时由 LeftRail 拉过一次，那次失败或没赶上时序就会一直空着；
+    // 切回模型页主动重拉，避免误显示"还没有接入模型"
+    if (isAdmin.value) void load()
   }
 })
 
@@ -926,6 +997,7 @@ function applyPreset(p: Platform) {
   if (!preset) return
   defaultModel.value = preset.default_model
   supportsThinking.value = preset.supports_thinking
+  contextSize.value = DEFAULT_CONTEXT_SIZE
 }
 
 function loadDraft() {
@@ -960,6 +1032,7 @@ function fillForm(p: LlmProviderConfig) {
   defaultModel.value = p.default_model
   displayName.value = p.name
   supportsThinking.value = p.supports_thinking
+  contextSize.value = normalizeContextSize(p.context_size)
 }
 
 /** 列表行点进来 / 点「编辑」：载入该行并展开表单 */
@@ -1046,6 +1119,9 @@ async function removeOne(p: LlmProviderConfig) {
 
 watch(open, (v) => {
   if (v) {
+    // 打开设置时主动拉一次：避免只在登录时拉的那次失败后列表一直空着，
+    // 也确保管理员看到的是服务端最新配置
+    if (isAdmin.value) void load()
     loadDraft()
     if (providerOptions.value.length === 0) loadProviders()
   }
@@ -1083,6 +1159,7 @@ async function onSave() {
     base_url: baseUrl.value,
     api_key: apiKey.value,
     default_model: defaultModel.value,
+    context_size: contextSize.value,
     supports_thinking: supportsThinking.value,
   }
   if (!editingId.value) {
@@ -1211,6 +1288,101 @@ const confirmPassword = ref('')
 const passwordSaving = ref(false)
 const passwordError = ref('')
 const passwordSaved = ref('')
+/** 账户页内的二级视图：点「密码修改」才展开三个输入框 */
+const passwordView = ref(false)
+
+/* ---------------- 设置内导航历史：顶部前进 / 后退 ---------------- */
+interface SettingsView {
+  nav: NavKey
+  password: boolean
+  agentForm: boolean
+}
+const viewHistory = ref<SettingsView[]>([
+  { nav: 'model', password: false, agentForm: false },
+])
+const viewIndex = ref(0)
+const hasViewHistory = computed(() => viewHistory.value.length > 1)
+const canGoBack = computed(() => viewIndex.value > 0)
+const canGoForward = computed(() => viewIndex.value < viewHistory.value.length - 1)
+
+// 重新打开设置时回到当前页签的一级视图：否则会残留上次的二级页面和历史记录
+watch(open, (v) => {
+  if (!v) return
+  viewHistory.value = [{ nav: nav.value, password: false, agentForm: false }]
+  viewIndex.value = 0
+  passwordView.value = false
+  agentFormOpen.value = false
+})
+
+function restoreView(v: SettingsView) {
+  nav.value = v.nav
+  passwordView.value = v.password
+  agentFormOpen.value = v.agentForm
+}
+
+function pushView() {
+  viewHistory.value = [
+    ...viewHistory.value.slice(0, viewIndex.value + 1),
+    {
+      nav: nav.value,
+      password: passwordView.value,
+      agentForm: agentFormOpen.value,
+    },
+  ]
+  viewIndex.value = viewHistory.value.length - 1
+}
+
+function goNav(next: NavKey) {
+  if (nav.value === next && !passwordView.value && !agentFormOpen.value) return
+  nav.value = next
+  passwordView.value = false
+  agentFormOpen.value = false
+  pushView()
+}
+
+function openPassword() {
+  // 每次进入都从空表单开始：顶层后退按钮不会走 backToAccount，得在这里清掉旧输入
+  passwordError.value = ''
+  oldPassword.value = ''
+  newPassword.value = ''
+  confirmPassword.value = ''
+  passwordView.value = true
+  pushView()
+}
+
+function openAgentForm() {
+  resetAgentForm()
+  agentFormOpen.value = true
+  pushView()
+}
+
+function goBack() {
+  if (!canGoBack.value) {
+    passwordView.value = false
+    agentFormOpen.value = false
+    return
+  }
+  viewIndex.value -= 1
+  restoreView(viewHistory.value[viewIndex.value])
+}
+
+function goForward() {
+  if (!canGoForward.value) return
+  viewIndex.value += 1
+  restoreView(viewHistory.value[viewIndex.value])
+}
+
+function backToAccount() {
+  goBack()
+  passwordError.value = ''
+  oldPassword.value = ''
+  newPassword.value = ''
+  confirmPassword.value = ''
+}
+
+// 底部保存按钮已移除：保留函数以便恢复，当前模板不再触发
+void saveAgent
+
 
 async function changePassword() {
   passwordError.value = ''
@@ -1286,7 +1458,30 @@ async function onTest() {
       >
         <!-- 顶部栏 -->
         <div class="flex items-center justify-between px-6 h-14 shrink-0 border-b border-stone-200">
-          <h2 class="text-[16px] font-semibold text-stone-800">设置</h2>
+          <div class="flex items-center gap-2">
+            <h2 class="text-[16px] font-semibold text-stone-800">设置</h2>
+            <template v-if="hasViewHistory">
+              <span class="mx-1 h-4 w-px bg-stone-200"></span>
+              <button
+                type="button"
+                @click="goBack"
+                :disabled="!canGoBack"
+                class="h-7 w-7 grid place-items-center rounded-lg text-stone-500 hover:bg-stone-100 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                title="后退"
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6" /></svg>
+              </button>
+              <button
+                type="button"
+                @click="goForward"
+                :disabled="!canGoForward"
+                class="h-7 w-7 grid place-items-center rounded-lg text-stone-500 hover:bg-stone-100 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                title="前进"
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6" /></svg>
+              </button>
+            </template>
+          </div>
           <div class="flex items-center gap-2">
             <button
               type="button"
@@ -1309,7 +1504,7 @@ async function onTest() {
               v-for="item in visibleNavItems"
               :key="item.key"
               type="button"
-              @click="nav = item.key"
+              @click="goNav(item.key)"
               class="w-full h-9 flex items-center gap-2.5 rounded-lg px-3 text-[13px] transition"
               :class="nav === item.key ? 'bg-stone-100 text-stone-900 font-medium' : 'text-stone-600 hover:bg-stone-100'"
             >
@@ -1554,6 +1749,20 @@ async function onTest() {
                   </p>
                 </label>
 
+                <!-- 上下文大小：按模型窗口裁剪对话历史，避免超长会话把上游撑爆 -->
+                <div class="mt-4 flex items-center justify-between gap-3">
+                  <span class="text-[12.5px] font-medium text-stone-600">
+                    上下文大小
+                    <span class="block text-[11px] font-normal text-stone-400">对话历史按此窗口裁剪，超出部分从最早轮次丢弃</span>
+                  </span>
+                  <select
+                    v-model.number="contextSize"
+                    class="h-9 shrink-0 rounded-lg border border-stone-200 bg-white px-2.5 text-[13px] text-stone-800 outline-none focus:border-stone-400"
+                  >
+                    <option v-for="opt in CONTEXT_SIZES" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+                  </select>
+                </div>
+
                 <!-- 选择模式开关：原藏在折叠区的「支持深度思考」显性化，
                      决定对话页该模型是否展示 快速/深度 档位选择 -->
                 <div class="mt-4 flex items-center justify-between gap-3">
@@ -1620,6 +1829,37 @@ async function onTest() {
               </div>
             </template>
 
+            <!-- 通用设置 -->
+            <template v-else-if="nav === 'general'">
+              <h3 class="text-[17px] font-semibold text-stone-800">通用设置</h3>
+              <p class="mt-1 text-[12.5px] text-stone-400">
+                外观偏好仅保存在当前浏览器，不影响其他设备。
+              </p>
+
+              <div class="mt-5 rounded-xl border border-stone-200 px-4 py-3.5">
+                <div class="flex items-center justify-between gap-4">
+                  <div class="min-w-0">
+                    <p class="text-[13px] font-medium text-stone-800">主题</p>
+                    <p class="mt-0.5 text-[11.5px] text-stone-400">选择浅色、深色，或跟随系统外观自动切换</p>
+                  </div>
+                  <div class="inline-flex shrink-0 rounded-lg border border-stone-200 bg-stone-50 p-0.5">
+                    <button
+                      v-for="opt in themeOptions"
+                      :key="opt.value"
+                      type="button"
+                      @click="setThemeMode(opt.value)"
+                      class="px-3 py-1.5 rounded-md text-[12px] transition"
+                      :class="themeMode === opt.value
+                        ? 'bg-white text-stone-900 font-medium shadow-sm'
+                        : 'text-stone-500 hover:text-stone-800'"
+                    >
+                      {{ opt.label }}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </template>
+
             <!-- 账户 -->
             <template v-else-if="nav === 'account'">
               <h3 class="text-[17px] font-semibold text-stone-800">账户</h3>
@@ -1627,7 +1867,9 @@ async function onTest() {
                 管理个人资料与登录密码，余额与用量统计即将开放。
               </p>
 
+              <p v-if="passwordSaved" class="mt-4 rounded-lg bg-green-50 px-3 py-2 text-[12px] text-green-700">{{ passwordSaved }}</p>
               <template v-if="isLoggedIn">
+                <template v-if="!passwordView">
                 <!-- 个人资料 -->
                 <div class="mt-4 rounded-xl border border-stone-200">
                   <div class="flex items-center gap-3 px-4 py-3.5">
@@ -1713,10 +1955,39 @@ async function onTest() {
                   <p v-if="profileSaved && !profileEditing" class="border-t border-stone-100 px-4 py-2 text-[11.5px] text-green-600">{{ profileSaved }}</p>
                 </div>
 
-                <!-- 修改密码 -->
-                <div class="mt-4 rounded-xl border border-stone-200 px-4 py-3.5">
-                  <h4 class="text-[13px] font-medium text-stone-800">修改密码</h4>
-                  <div class="mt-3 space-y-2">
+                <!-- 密码修改入口 -->
+                <button
+                  type="button"
+                  @click="openPassword"
+                  class="mt-4 w-full flex items-center justify-between gap-3 rounded-xl border border-stone-200 px-4 py-3.5 text-left hover:bg-stone-50 transition"
+                >
+                  <span class="min-w-0">
+                    <span class="block text-[13px] font-medium text-stone-800">密码修改</span>
+                    <span class="block text-[11.5px] text-stone-400">更新登录密码，修改后需重新登录</span>
+                  </span>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 text-stone-400"><path d="m9 18 6-6 6-6" /></svg>
+                </button>
+
+                <div class="mt-4 flex justify-end">
+                  <button
+                    type="button"
+                    @click="onLogout"
+                    class="h-8 px-4 rounded-lg border text-[13px] transition"
+                    :class="
+                      logoutConfirm
+                        ? 'border-red-200 bg-red-50 text-red-600 hover:bg-red-100'
+                        : 'border-stone-200 text-stone-600 hover:border-red-200 hover:text-red-600'
+                    "
+                  >
+                    {{ logoutConfirm ? '确认退出' : '退出登录' }}
+                  </button>
+                </div>
+                </template>
+
+                <!-- 二级：密码修改 -->
+                <template v-else>
+                  <h4 class="mt-4 text-[13px] font-medium text-stone-800">密码修改</h4>
+                  <div class="mt-4 space-y-2">
                     <input
                       v-model="oldPassword"
                       type="password"
@@ -1740,33 +2011,24 @@ async function onTest() {
                     />
                   </div>
                   <p v-if="passwordError" class="mt-2 text-[11.5px] text-red-600">{{ passwordError }}</p>
-                  <p v-if="passwordSaved" class="mt-2 text-[11.5px] text-green-600">{{ passwordSaved }}</p>
-                  <div class="mt-3 flex justify-end">
+                  <div class="mt-4 flex justify-end gap-2">
+                    <button
+                      type="button"
+                      @click="backToAccount"
+                      class="h-8 px-3 rounded-lg border border-stone-200 text-[12.5px] text-stone-600 hover:bg-stone-50 transition"
+                    >
+                      取消
+                    </button>
                     <button
                       type="button"
                       @click="changePassword"
                       :disabled="passwordSaving"
-                      class="h-8 px-4 rounded-lg border border-stone-200 text-[12.5px] text-stone-700 hover:bg-stone-50 disabled:opacity-50 transition"
+                      class="h-8 px-4 rounded-lg bg-stone-800 text-[12.5px] text-white hover:bg-stone-700 disabled:opacity-50 transition"
                     >
-                      {{ passwordSaving ? '提交中…' : '修改密码' }}
+                      {{ passwordSaving ? '提交中…' : '确认修改' }}
                     </button>
                   </div>
-                </div>
-
-                <div class="mt-4 flex justify-end">
-                  <button
-                    type="button"
-                    @click="onLogout"
-                    class="h-8 px-4 rounded-lg border text-[13px] transition"
-                    :class="
-                      logoutConfirm
-                        ? 'border-red-200 bg-red-50 text-red-600 hover:bg-red-100'
-                        : 'border-stone-200 text-stone-600 hover:border-red-200 hover:text-red-600'
-                    "
-                  >
-                    {{ logoutConfirm ? '确认退出' : '退出登录' }}
-                  </button>
-                </div>
+                </template>
               </template>
               <p v-else class="mt-4 text-[12.5px] text-stone-400">当前未登录，依赖账户的功能不可用。</p>
             </template>
@@ -1782,7 +2044,7 @@ async function onTest() {
                 </div>
                 <button
                   type="button"
-                  @click="resetAgentForm(); agentFormOpen = true"
+                  @click="openAgentForm"
                   class="h-8 px-3 shrink-0 rounded-lg bg-stone-800 text-[12.5px] text-white hover:bg-stone-700 transition"
                 >
                   + 新增 Agent
@@ -1794,12 +2056,11 @@ async function onTest() {
               <p v-if="agentLoading" class="mt-3 text-[12px] text-stone-400">加载中…</p>
 
               <div v-if="!agentFormOpen" class="mt-4 space-y-2">
-                <button
+                <div
                   v-for="a in adminAgents"
                   :key="a.id"
-                  type="button"
                   @click="editAgent(a)"
-                  class="w-full flex items-center justify-between gap-3 rounded-xl border border-stone-200 px-4 py-3 text-left hover:bg-stone-50 transition"
+                  class="w-full flex items-center justify-between gap-3 rounded-xl border border-stone-200 px-4 py-3 text-left hover:bg-stone-50 transition cursor-pointer"
                 >
                   <span class="min-w-0">
                     <span class="block text-[13.5px] font-medium text-stone-800 truncate">
@@ -1810,10 +2071,20 @@ async function onTest() {
                       {{ a.agent_key }} · 提示词 v{{ a.active_prompt_version }}
                     </span>
                   </span>
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="shrink-0 text-stone-400" stroke-linecap="round">
-                    <path d="m9 18 6-6-6-6" />
-                  </svg>
-                </button>
+                  <span class="flex shrink-0 items-center gap-2">
+                    <button
+                      type="button"
+                      @click.stop="removeAgent(a.id)"
+                      class="rounded-lg px-2 py-1 text-[11.5px] text-red-500 hover:bg-red-50 transition"
+                      title="删除 Agent"
+                    >
+                      删除
+                    </button>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="shrink-0 text-stone-400" stroke-linecap="round">
+                      <path d="m9 18 6-6-6-6" />
+                    </svg>
+                  </span>
+                </div>
                 <p v-if="!adminAgents.length && !agentLoading" class="py-8 text-center text-[12.5px] text-stone-400">还没有 Agent，点右上角新增。</p>
               </div>
 
@@ -2170,33 +2441,6 @@ async function onTest() {
                   </div>
                 </div>
 
-                <div class="flex items-center justify-between gap-3">
-                  <button
-                    v-if="agentEditingId !== null"
-                    type="button"
-                    @click="removeAgent"
-                    class="h-9 px-3 rounded-lg border border-red-200 text-[12.5px] text-red-600 hover:bg-red-50 transition"
-                  >
-                    删除
-                  </button>
-                  <span v-else />
-                  <div class="flex items-center gap-2">
-                    <button
-                      type="button"
-                      @click="agentFormOpen = false"
-                      class="h-9 px-4 rounded-lg border border-stone-200 text-[12.5px] text-stone-600 hover:bg-stone-50 transition"
-                    >
-                      返回
-                    </button>
-                    <button
-                      type="button"
-                      @click="saveAgent"
-                      class="h-9 px-5 rounded-lg bg-stone-800 text-[12.5px] text-white hover:bg-stone-700 transition"
-                    >
-                      保存
-                    </button>
-                  </div>
-                </div>
               </div>
             </template>
 

@@ -56,6 +56,17 @@ class ToolCallOut(BaseModel):
     citations_json: list[dict[str, Any]] | None = None
 
 
+class TurnUsageOut(BaseModel):
+    """一条助手消息所属轮次的 token 用量"""
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    input_token_details: dict[str, Any] = Field(default_factory=dict)
+    output_token_details: dict[str, Any] = Field(default_factory=dict)
+    model_calls: int = 0
+
+
 class MessageOut(BaseModel):
     """消息响应元素"""
 
@@ -70,6 +81,20 @@ class MessageOut(BaseModel):
     created_at: datetime
     turn_id: int | None = None
     tool_calls: list[ToolCallOut] = Field(default_factory=list)
+    turn_usage: TurnUsageOut | None = None
+
+
+class ContextUsageOut(BaseModel):
+    """会话上下文用量：基于未摘要消息 + 摘要的 token 估算"""
+
+    used_tokens: int
+    context_size: int
+    remaining_tokens: int
+    usage_ratio: float
+    message_count: int
+    summary_chars: int
+    # used_tokens 的来源：api=上游真实 usage，estimated=tiktoken 估算
+    source: str = "estimated"
 
 
 class SessionOut(BaseModel):

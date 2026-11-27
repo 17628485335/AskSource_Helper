@@ -13,12 +13,10 @@ from .chat_manager import (
     ModelAgent,
     load_tools,
 )
-from .router import router
 from .schemas import ChatRequest
 from .service import stream_chat
 
 __all__ = [
-    "router",
     "ChatRequest",
     "ChatManager",
     "ModelAgent",

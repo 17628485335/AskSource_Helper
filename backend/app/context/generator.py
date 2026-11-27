@@ -32,7 +32,6 @@ SYSTEM_PROMPTS: dict[str, str] = {
 - 用可复用的占位描述（如「用户偏好中文」），不要编造具体姓名、公司或隐私信息；只输出内容本身。""",
 }
 
-GENERATABLE_KINDS = tuple(SYSTEM_PROMPTS)
 MAX_GENERATED_CHARS = 8000
 
 

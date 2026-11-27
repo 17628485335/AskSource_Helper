@@ -7,10 +7,9 @@
 """
 
 from .stream_protocol import (
-    ALL_EVENT_TYPES,
-    EventType,
     ev_citations,
     ev_reasoning,
+    ev_usage,
     ev_segment_start,
     ev_token,
     ev_tool_end,
@@ -31,14 +30,13 @@ from .tools import (
 )
 
 __all__ = [
-    "ALL_EVENT_TYPES",
-    "EventType",
     "ev_token",
     "ev_reasoning",
     "ev_segment_start",
     "ev_tool_start",
     "ev_tool_end",
     "ev_citations",
+    "ev_usage",
     "ToolCategory",
     "ToolSpec",
     "register_tool",

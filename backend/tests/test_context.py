@@ -8,9 +8,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from langchain_core.messages import SystemMessage
 
-import app.context.assembler as assembler
-from app.agents.service import AgentContext
-from app.context.assembler import build_context, build_skills_snapshot
+from app.context.assembler import build_skills_snapshot
 from app.context.models import AgentContextBinding, AgentContextDoc, UserContextDoc
 from app.main import app
 
@@ -110,70 +108,6 @@ def test_orm_tables_have_expected_columns():
     )
 
 
-def _binding(key, resolver, ref_key, priority, tokens, trust="data", enabled=True, title=None):
-    return SimpleNamespace(
-        id=priority,
-        key=key,
-        title=title or key,
-        resolver=resolver,
-        ref_key=ref_key,
-        enabled=enabled,
-        priority=priority,
-        max_tokens=tokens,
-        trust_level=trust,
-    )
-
-
-def test_build_context_resolves_agent_user_and_generated_sections(monkeypatch):
-    ctx = AgentContext(
-        agent_id=1,
-        agent_key="chat",
-        prompt_version=1,
-        system_prompt=None,
-        platform="",
-        model="",
-        thinking=False,
-        tool_names=["web_search"],
-    )
-    bindings = [
-        _binding("user_profile", "user_doc", "user_profile", 50, 500, trust="data", title="User Profile"),
-        _binding("soul", "agent_doc", "soul", 10, 500, trust="policy", title="Soul"),
-        _binding("skills_snapshot", "generated", "skills_snapshot", 20, 500, trust="generated", title="Skills Snapshot"),
-        _binding("memory", "memory", "long_term_memory", 60, 500),
-    ]
-
-    async def fake_list_bindings(_db, _agent_id):
-        return bindings
-
-    async def fake_find_agent_doc(_db, _agent_id, key):
-        assert key == "soul"
-        return SimpleNamespace(title="Soul", content="简洁直接地回答")
-
-    async def fake_find_user_doc(_db, user_id, key):
-        assert user_id == 7 and key == "user_profile"
-        return SimpleNamespace(title="User Profile", content="用户偏好中文")
-
-    monkeypatch.setattr(assembler.context_service, "list_bindings", fake_list_bindings)
-    monkeypatch.setattr(assembler.context_service, "find_agent_doc", fake_find_agent_doc)
-    monkeypatch.setattr(assembler.context_service, "find_user_doc", fake_find_user_doc)
-
-    bundle = build_context_result = __import__("asyncio").run(
-        build_context(SimpleNamespace(), ctx, user_id=7, session_id=99)
-    )
-    assert build_context_result is bundle
-    assert len(bundle.messages) == 1
-    assert isinstance(bundle.messages[0], SystemMessage)
-    assert bundle.section_keys == ["soul", "skills_snapshot", "user_profile"]
-    assert bundle.approx_tokens > 0
-
-    text = bundle.messages[0].content
-    assert text.index("[SOUL]") < text.index("[SKILLS]") < text.index("[USER_PROFILE]")
-    assert "用户偏好中文" in text
-    assert "web_search" in text
-    assert "仅作事实参考" in text
-    assert {item["key"] for item in bundle.skipped} == {"memory"}
-
-
 def test_skills_snapshot_respects_whitelist():
     text = build_skills_snapshot(["web_search"])
     assert "web_search" in text
@@ -194,7 +128,7 @@ def test_create_global_agent_doc_rejects_duplicate_key():
         asyncio.run(context_service.create_agent_doc(FakeDb(), payload))
 
 
-def test_astream_places_context_after_system_prompt_before_history():
+def test_astream_places_system_prompt_before_history():
     from langchain_core.messages import HumanMessage
 
     from app.chat.chat_manager import ModelAgent
@@ -215,7 +149,6 @@ def test_astream_places_context_after_system_prompt_before_history():
     agent.thinking_model = None
     agent.supports_thinking = False
 
-    context_block = SystemMessage(content="CONTEXT")
     stale_system = SystemMessage(content="OLD SYSTEM")
     human = HumanMessage(content="hi")
 
@@ -225,17 +158,15 @@ def test_astream_places_context_after_system_prompt_before_history():
             async for event in agent.astream(
                 [stale_system, human],
                 system_prompt="SYS",
-                context_messages=[context_block],
             )
         ]
 
     assert asyncio.run(collect()) == []
     messages = seen["messages"]
-    assert len(messages) == 3
+    assert len(messages) == 2
     assert isinstance(messages[0], SystemMessage)
     assert "SYS" in messages[0].content
-    assert messages[1] is context_block
-    assert messages[2] is human
+    assert messages[1] is human
 
 
 def test_generate_route_registered_and_admin_only():

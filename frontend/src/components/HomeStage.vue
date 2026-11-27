@@ -9,6 +9,9 @@ import { useAuth } from '../stores/auth'
 import { useModels } from '../stores/models'
 import { useAgents } from '../stores/agents'
 import type { AgentDto, ChatModelOption } from '../api/settings'
+import { getContextUsage, type ContextUsageDto } from '../api/session'
+import { formatDateTime, formatTokenCompact } from '../utils/format'
+import { sourceHost, safeHttpUrl } from '../utils/url'
 
 /* ---------------- 首页态热力图 Sessions / Credits（从 git 历史恢复） ---------------- */
 const heatTab = ref<'sessions' | 'credits'>('sessions')
@@ -85,7 +88,13 @@ const autoRef = ref<HTMLElement | null>(null)
 const pickedModel = ref<ChatModelOption | null>(null)
 const modelOpen = ref(false)
 const modelRef = ref<HTMLElement | null>(null)
-const { models: chatModels, usableModels, load: loadModels, clear: clearModels } = useModels()
+const {
+  models: chatModels,
+  usableModels,
+  loaded: modelsLoaded,
+  load: loadModels,
+  clear: clearModels,
+} = useModels()
 
 /* ---------------- Agent 选择 ---------------- */
 const agentOpen = ref(false)
@@ -158,6 +167,28 @@ function chooseModel(m: ChatModelOption) {
   modelOpen.value = false
 }
 
+/** 当前 hover 展开 token 用量的消息序号；null 表示没有 */
+const hoveredUsageIndex = ref<number | null>(null)
+let usageCloseTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 鼠标进入图标：取消待关闭定时器并展开 */
+function openUsage(i: number) {
+  if (usageCloseTimer) {
+    clearTimeout(usageCloseTimer)
+    usageCloseTimer = null
+  }
+  hoveredUsageIndex.value = i
+}
+
+/** 鼠标离开图标/面板：延迟关闭，留时间让鼠标穿过两者之间的间隙 */
+function closeUsage() {
+  if (usageCloseTimer) clearTimeout(usageCloseTimer)
+  usageCloseTimer = setTimeout(() => {
+    hoveredUsageIndex.value = null
+    usageCloseTimer = null
+  }, 150)
+}
+
 const micOn = ref(false)
 
 function toggleMic() {
@@ -209,6 +240,48 @@ watch(stageView, (v) => {
 })
 watch(sessionId, () => jumpToLatest())
 onMounted(() => jumpToLatest())
+
+/* ---------------- 上下文用量（右侧详情栏） ---------------- */
+// 用 ref 存（普通 Map 不是响应式的，写入不会触发界面更新）；带上会话标记避免跨会话串数据
+const usageEntry = ref<{ session: number; data: ContextUsageDto } | null>(null)
+const contextLoading = ref(false)
+const contextError = ref('')
+let contextRequestSeq = 0
+
+const contextUsage = computed(() =>
+  sessionId.value != null && usageEntry.value?.session === sessionId.value
+    ? usageEntry.value.data
+    : null,
+)
+
+/** 拉取当前会话上下文用量；没有会话就不请求，模型窗口缺失时用默认值兜底 */
+async function refreshContextUsage() {
+  if (sessionId.value == null) return
+  const seq = ++contextRequestSeq
+  const session = sessionId.value
+  const size = pickedModel.value?.context_size || 200000
+  contextLoading.value = true
+  try {
+    const result = await getContextUsage(session, size)
+    // 只接受最后一次请求的结果；跨会话的结果一律丢弃
+    if (seq === contextRequestSeq && sessionId.value === session) {
+      usageEntry.value = { session, data: result }
+    }
+  } catch (e) {
+    // 网络抖动 / 接口失败：保留上次成功的结果，并暴露原因
+    contextError.value = e instanceof Error ? e.message : '用量请求失败'
+  } finally {
+    if (seq === contextRequestSeq) contextLoading.value = false
+  }
+}
+
+/** 会话切换、模型窗口变化、流式结束时刷新（不在每个 token 到达时请求） */
+watch(
+  [sessionId, pickedModel],
+  () => void refreshContextUsage(),
+  { immediate: true },
+)
+watch(busy, (v) => { if (!v) void refreshContextUsage() })
 
 /** 当前选中的模型有没有深度档位（后端 /settings/models 的 supports_thinking） */
 const canThink = computed(() => pickedModel.value?.supports_thinking === true)
@@ -415,6 +488,8 @@ function openChatDetails() {
   sourceMessageIndex.value = null
   detailCollapsed.value = false
   detailMode.value = 'chat'
+  // 展开详情栏时补一次拉取，避免会话已在、watch 未触发导致一直显示「—」
+  void refreshContextUsage()
 }
 const lastError = computed(() => [...messages.value].reverse().find((m) => m.error)?.error || '')
 const lastActivity = computed(() => {
@@ -422,37 +497,15 @@ const lastActivity = computed(() => {
   return done.length ? new Date().toLocaleTimeString('zh-CN', { hour12: false }) : ''
 })
 
-/** 消息气泡下方的时间：悬停消息时才显现，完整到秒（年-月-日 时:分:秒） */
-function formatMsgTime(iso: string): string {
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return ''
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
-}
-
-/** 引用卡片上的域名：后端给的 title 可能来自路径拼接，单独一行网址更好识别 */
-function sourceDomain(url: string): string {
-  try {
-    return new URL(url).hostname.replace(/^www\./, '')
-  } catch {
-    return ''
-  }
-}
-
 /** 按钮里最多展示 3 个不同站点的图标，同一域名只占一个位置 */
 function buttonSources(citations: ChatMessage['citations']) {
   const seen = new Set<string>()
   return citations.filter((c) => {
-    const domain = sourceDomain(c.url)
+    const domain = sourceHost(c.url)
     if (!domain || seen.has(domain)) return false
     seen.add(domain)
     return true
   }).slice(0, 3)
-}
-
-/** 只放行 http(s)：url 是外部搜索接口返的，进 href 就能让 javascript: 变成 XSS 入口 */
-function safeSourceUrl(url: string): string {
-  return /^https?:\/\//i.test(url) ? url : ''
 }
 
 /** 模型偶尔会在正文末尾自己列「参考来源：[n]…」，与下方按钮重复；展示时去掉这一段 */
@@ -517,6 +570,13 @@ async function copyMsg(i: number, text: string) {
   }
 }
 
+/** 点开模型下拉时补一次拉取：首次加载失败（登录态恢复晚 / 网络抖动）后，
+ * store 里 loaded 仍为 false，用户点开下拉是唯一的重试入口 */
+function toggleModelDropdown() {
+  modelOpen.value = !modelOpen.value
+  if (modelOpen.value && !modelsLoaded.value) void loadModels(true)
+}
+
 function closeDropdownsOnOutside(e: MouseEvent) {
   if (approveRef.value && !approveRef.value.contains(e.target as Node)) approveOpen.value = false
   if (autoRef.value && !autoRef.value.contains(e.target as Node)) autoOpen.value = false
@@ -544,6 +604,7 @@ watch(isLoggedIn, (v) => {
 })
 onBeforeUnmount(() => {
   document.removeEventListener('mousedown', closeDropdownsOnOutside)
+  if (usageCloseTimer) clearTimeout(usageCloseTimer)
   clearTicker()
 })
 </script>
@@ -640,7 +701,7 @@ onBeforeUnmount(() => {
               >{{ m.content }}</div>
 
               <div class="flex items-center gap-1.5 px-1">
-                <p class="text-[11px] text-stone-400 opacity-0 transition group-hover:opacity-100">{{ formatMsgTime(m.created_at) }}</p>
+                <p class="text-[11px] text-stone-400 opacity-0 transition group-hover:opacity-100">{{ formatDateTime(m.created_at) }}</p>
                 <div class="flex items-center gap-1 opacity-0 transition group-hover:opacity-100">
                   <button
                     v-if="i === lastUserIndex"
@@ -743,7 +804,7 @@ onBeforeUnmount(() => {
                       >
                         <template v-for="c in tc.citations" :key="c.index">
                           <a
-                            v-if="safeSourceUrl(c.url)"
+                            v-if="safeHttpUrl(c.url)"
                             :href="c.url"
                             target="_blank"
                             rel="noopener noreferrer nofollow"
@@ -751,7 +812,7 @@ onBeforeUnmount(() => {
                             class="inline-flex max-w-[240px] items-center gap-1.5 rounded-full border border-stone-200 bg-white px-2 py-0.5 text-[11px] text-stone-600 transition hover:border-stone-300 hover:text-stone-900"
                           >
                             <SiteIcon :url="c.url" :size="14" />
-                            <span class="truncate">{{ c.title || sourceDomain(c.url) || c.url }}</span>
+                            <span class="truncate">{{ c.title || sourceHost(c.url) || c.url }}</span>
                           </a>
                           <span
                             v-else
@@ -809,7 +870,48 @@ onBeforeUnmount(() => {
                 </button>
               </div>
 
-              <p v-if="(m.content || m.error) && m.created_at" class="mt-1.5 px-1 text-[11px] text-stone-400 opacity-0 transition group-hover:opacity-100">{{ formatMsgTime(m.created_at) }}</p>
+              <!-- token 用量：收起显示总数，展开详情浮在上方覆盖，不占布局高度 -->
+              <div
+                v-if="m.turnUsage && m.role === 'assistant'"
+                class="relative mt-1.5 px-1"
+                @mouseenter="openUsage(i)"
+                @mouseleave="closeUsage()"
+              >
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-1 rounded-md px-1 py-0.5 text-[10.5px] text-stone-400 hover:bg-stone-100 hover:text-stone-600 transition"
+                  title="本轮 token 用量"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+                    <circle cx="12" cy="12" r="3" />
+                  </svg>
+                  {{ m.turnUsage.total_tokens.toLocaleString() }} tokens
+                </button>
+                <div
+                  v-if="hoveredUsageIndex === i"
+                  class="absolute bottom-full left-1 z-20 mb-1.5 inline-grid grid-cols-2 gap-x-4 gap-y-1 rounded-lg border border-stone-200 bg-white px-3 py-2 text-[11px] shadow-lg"
+                >
+                  <span class="text-stone-400">输入</span>
+                  <span class="text-right text-stone-700">{{ m.turnUsage.input_tokens.toLocaleString() }}</span>
+                  <span class="text-stone-400">输出</span>
+                  <span class="text-right text-stone-700">{{ m.turnUsage.output_tokens.toLocaleString() }}</span>
+                  <span class="text-stone-400">合计</span>
+                  <span class="text-right font-medium text-stone-800">{{ m.turnUsage.total_tokens.toLocaleString() }}</span>
+                  <span class="text-stone-400">模型调用</span>
+                  <span class="text-right text-stone-700">{{ m.turnUsage.model_calls }} 次</span>
+                  <template v-if="m.turnUsage.input_token_details?.cache_read">
+                    <span class="text-stone-400">缓存命中</span>
+                    <span class="text-right text-emerald-600">{{ m.turnUsage.input_token_details.cache_read.toLocaleString() }}</span>
+                  </template>
+                  <template v-if="m.turnUsage.output_token_details?.reasoning">
+                    <span class="text-stone-400">推理</span>
+                    <span class="text-right text-stone-700">{{ m.turnUsage.output_token_details.reasoning.toLocaleString() }}</span>
+                  </template>
+                </div>
+              </div>
+
+              <p v-if="(m.content || m.error) && m.created_at" class="mt-1.5 px-1 text-[11px] text-stone-400 opacity-0 transition group-hover:opacity-100">{{ formatDateTime(m.created_at) }}</p>
 
             </div>
           </div>
@@ -1067,7 +1169,7 @@ onBeforeUnmount(() => {
               <div ref="modelRef" class="relative">
                 <button
                   type="button"
-                  @click="modelOpen = !modelOpen"
+                  @click="toggleModelDropdown"
                   class="h-9 px-3 inline-flex items-center gap-1.5 rounded-lg text-[12px] text-stone-600 hover:bg-stone-100 transition"
                   title="选择模型"
                 >
@@ -1082,7 +1184,7 @@ onBeforeUnmount(() => {
                 </button>
                 <div
                   v-if="modelOpen"
-                  class="absolute right-0 bottom-10 z-30 w-60 max-h-72 overflow-y-auto scroll-thin rounded-xl bg-white border border-stone-200 shadow-lg shadow-stone-900/5 p-1.5"
+                  class="absolute left-1/2 -translate-x-1/2 bottom-10 z-30 w-fit min-w-36 max-w-72 max-h-72 overflow-y-auto scroll-thin rounded-xl bg-white border border-stone-200 shadow-lg shadow-stone-900/5 p-1.5"
                 >
                   <button
                     v-for="m in chatModels"
@@ -1090,7 +1192,7 @@ onBeforeUnmount(() => {
                     type="button"
                     :disabled="!isUsable(m)"
                     @click="chooseModel(m)"
-                    class="w-full text-left px-3 py-2 rounded-lg text-[12.5px] transition flex items-center justify-between gap-2"
+                    class="w-full text-left px-3 py-2 rounded-lg text-[12.5px] transition flex items-center gap-1.5"
                     :class="
                       !isUsable(m)
                         ? 'text-stone-300 cursor-not-allowed'
@@ -1100,7 +1202,13 @@ onBeforeUnmount(() => {
                     "
                     :title="isUsable(m) ? '' : m.unavailable_reason || '该模型构建失败，请联系管理员'"
                   >
-                    <span class="truncate">{{ optionLabel(m) }}</span>
+                    <span class="min-w-0 truncate">{{ optionLabel(m) }}</span>
+                    <span
+                      v-if="formatTokenCompact(m.context_size)"
+                      class="shrink-0 rounded bg-stone-100 px-1.5 py-0.5 text-[10px] text-stone-500"
+                    >
+                      {{ formatTokenCompact(m.context_size) }}
+                    </span>
                     <span v-if="!isUsable(m)" class="shrink-0 text-[10.5px]">不可用</span>
                   </button>
                   <p v-if="!chatModels.length" class="px-3 py-2 text-[12px] text-stone-400">
@@ -1269,6 +1377,35 @@ onBeforeUnmount(() => {
             <p class="text-[12.5px] text-stone-700">{{ messages.length }}</p>
           </div>
         </div>
+        <div>
+          <div class="flex items-baseline justify-between mb-1.5">
+            <p class="text-[10.5px] text-stone-400">上下文用量</p>
+            <span class="text-[10.5px] text-stone-400">{{ contextLoading ? '计算中…' : '' }}</span>
+          </div>
+          <template v-if="contextUsage">
+            <div class="h-1.5 w-full overflow-hidden rounded-full bg-stone-200/80">
+              <div
+                class="h-full rounded-full transition-[width] duration-300"
+                :class="contextUsage.usage_ratio > 0.9 ? 'bg-red-400' : contextUsage.usage_ratio > 0.7 ? 'bg-amber-400' : 'bg-emerald-500'"
+                :style="{ width: `${Math.max(1, contextUsage.usage_ratio * 100)}%` }"
+              />
+            </div>
+            <div class="mt-1.5 flex items-baseline justify-between gap-2">
+              <p class="text-[12px] text-stone-700">
+                剩余 <span class="font-medium">{{ formatTokenCompact(contextUsage.remaining_tokens) }}</span>
+              </p>
+              <p class="text-[10px] text-stone-400">
+                {{ formatTokenCompact(contextUsage.used_tokens) }} / {{ formatTokenCompact(contextUsage.context_size) }}
+                <span v-if="contextUsage.source === 'api'" title="来自模型 API 返回的真实 token 用量">· 实测</span>
+                <span v-else title="由 tiktoken 估算，模型 API 尚未返回用量">· 估算</span>
+              </p>
+            </div>
+            <p v-if="contextUsage.summary_chars" class="mt-1 text-[10px] text-stone-400">
+              已压缩历史 · 摘要 {{ contextUsage.summary_chars }} 字
+            </p>
+          </template>
+          <p v-else class="text-[11.5px] text-stone-400">—</p>
+        </div>
         <div v-if="usedTools.length">
           <p class="text-[10.5px] text-stone-400 mb-1.5">使用过的工具</p>
           <div class="flex flex-wrap gap-1.5">
@@ -1308,7 +1445,7 @@ onBeforeUnmount(() => {
         <ul v-if="activeCitations.length" class="max-h-[calc(100vh-6rem)] space-y-2.5 overflow-y-auto scroll-thin pr-1">
           <li v-for="c in activeCitations" :key="c.index">
             <a
-              v-if="safeSourceUrl(c.url)"
+              v-if="safeHttpUrl(c.url)"
               :href="c.url"
               target="_blank"
               rel="noopener noreferrer nofollow"
@@ -1320,13 +1457,13 @@ onBeforeUnmount(() => {
                 <span class="min-w-0 flex-1">
                   <span class="flex items-start justify-between gap-2">
                     <span class="line-clamp-2 text-[12.5px] font-medium leading-[1.5] text-stone-800">
-                      {{ c.title || sourceDomain(c.url) || c.url }}
+                      {{ c.title || sourceHost(c.url) || c.url }}
                     </span>
                     <span class="shrink-0 rounded-md bg-stone-100 px-1.5 text-[10px] leading-5 text-stone-500">{{ c.index }}</span>
                   </span>
                   <span v-if="c.snippet" class="mt-1.5 block line-clamp-2 text-[11px] leading-[1.6] text-stone-500">{{ c.snippet }}</span>
                   <span class="mt-1.5 flex items-center gap-1.5 text-[10.5px] text-stone-400">
-                    <span class="min-w-0 truncate">{{ sourceDomain(c.url) }}</span>
+                    <span class="min-w-0 truncate">{{ sourceHost(c.url) }}</span>
                     <span v-if="c.published_date" class="shrink-0">· {{ c.published_date }}</span>
                     <span v-if="c.kind === 'page'" class="ml-auto shrink-0 rounded bg-emerald-50 px-1 text-emerald-600">已读</span>
                   </span>

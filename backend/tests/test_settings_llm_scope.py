@@ -8,10 +8,14 @@
 
 import inspect
 
+import pytest
 from fastapi.routing import APIRoute
+from langchain_core.messages import HumanMessage
+from pydantic import ValidationError
 from fastapi.testclient import TestClient
 
 from app.chat import ChatManager, ModelAgent
+from app.chat.chat_manager import _trim_history
 from app.main import app
 from app.settings.schemas import ProviderWrite
 
@@ -113,3 +117,21 @@ def test_config_resolution_has_no_user_dimension():
     assert not any(hasattr(ChatManager, n) for n in ("shared", "reset_shared", "env_config"))
     # 对话能力在单模型实例上，不在池上
     assert callable(ModelAgent.stream) and not hasattr(ChatManager, "stream")
+
+
+def test_provider_write_context_size_validation():
+    assert ProviderWrite(platform="deepseek").context_size == 200000
+    assert ProviderWrite(platform="deepseek", context_size=1048576).context_size == 1048576
+    with pytest.raises(ValidationError):
+        ProviderWrite(platform="deepseek", context_size=512)
+
+
+def test_trim_history_keeps_latest_within_budget():
+    # 每条 2000 字 ≈ 1000 token；8K 窗口按 60% 算预算约 4915 token，只留得下 4 条
+    msgs = [HumanMessage(content="x" * 2000) for _ in range(8)]
+    trimmed = _trim_history(msgs, 8192)
+    assert 0 < len(trimmed) < len(msgs)
+    assert trimmed[-1] is msgs[-1]
+
+    small = [HumanMessage(content="短") for _ in range(3)]
+    assert _trim_history(small, 8192) == small

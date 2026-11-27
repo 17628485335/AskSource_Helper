@@ -2,6 +2,8 @@
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+DEFAULT_CONTEXT_SIZE = 200000
+
 
 class ProviderWrite(BaseModel):
     """写入单个 LLM 提供商（PUT 请求体元素）"""
@@ -11,6 +13,12 @@ class ProviderWrite(BaseModel):
     base_url: str = Field(default="", max_length=512)
     api_key: str = Field(default="", max_length=512)
     default_model: str = Field(default="", max_length=128)
+    context_size: int = Field(
+        default=DEFAULT_CONTEXT_SIZE,
+        ge=1024,
+        le=2_000_000,
+        description="模型上下文窗口（token），用于裁剪对话历史",
+    )
     supports_thinking: bool = False
     is_active: bool = False
 
@@ -43,6 +51,7 @@ class ProviderOut(BaseModel):
     base_url: str
     api_key: str
     default_model: str
+    context_size: int
     supports_thinking: bool
     is_active: bool
 
@@ -62,6 +71,7 @@ class ChatModelOption(BaseModel):
     platform_label: str
     model: str
     name: str = ""
+    context_size: int = DEFAULT_CONTEXT_SIZE
     supports_thinking: bool = Field(
         default=False,
         description="该行是否有深度档位：前端据此决定是否展示 快速/深度 选择",

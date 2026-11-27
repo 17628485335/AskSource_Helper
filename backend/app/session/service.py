@@ -1,11 +1,10 @@
-"""会话服务：新建会话、消息落库、读取对话历史
+"""会话服务：新建会话、消息落库、读取会话数据
 
-职责边界：这里只管数据读写，不掺 HTTP 语义（404 / 422 由 router 负责）。
-chat / graph 代码可直接调用本模块，前端则通过 router 暴露的接口访问。
+职责边界：这里只管数据读写，不掺 HTTP 语义（404 / 422 由 router 负责），
+也不做消息格式转换。把数据转成 langchain 消息并组装上下文在 app.context.history。
 
-对话历史提供两个入口：
-- load_messages：返回 ORM 行，给接口序列化、前端渲染；
-- load_history：返回 langchain BaseMessage，可直接拼进 create_agent 的 messages。
+对话历史数据入口：load_messages 返回 ORM 行，给接口序列化、前端渲染，
+也给 app.context.history 组装成模型可用的消息。
 """
 
 from typing import Any, Sequence
@@ -13,7 +12,7 @@ from typing import Any, Sequence
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import ChatMessage, ChatSession, ChatToolCall
+from .models import ChatMessage, ChatSession, ChatSummary, ChatToolCall, ChatTurn
 
 # 默认只带最近若干轮进 prompt，避免上下文超长
 DEFAULT_HISTORY_LIMIT = 20
@@ -135,14 +134,25 @@ async def append_message(
     tool_calls: list[dict[str, Any]] | None = None,
     turn_id: int | None = None,
     tokens: int = 0,
+    platform: str = "",
+    model: str = "",
 ) -> ChatMessage | None:
     """往会话追加一条消息及其工具调用，并同步维护计数 / 标题 / 活跃时间。
 
     工具调用与消息在同一事务落库；会话不存在或不属于该用户返回 None。
+    user 消息落库时创建 chat_turn 行（除非调用方已指定 turn_id），
+    后续 assistant / 工具行由调用方传入同一个 turn_id。
     """
     session = await get_session(db, session_id, user_id)
     if session is None:
         return None
+
+    # user 消息开一轮：创建 chat_turn 行，turn_id 取自它的自增 id
+    if role == "user" and turn_id is None:
+        turn = ChatTurn(session_id=session.id, platform=platform, model=model)
+        db.add(turn)
+        await db.flush()  # 拿到 turn.id
+        turn_id = turn.id
 
     text = content.strip()
     message = ChatMessage(
@@ -155,9 +165,6 @@ async def append_message(
     )
     db.add(message)
     await db.flush()  # 先拿到 message.id，工具行才能带上外键
-    # user 行就是一轮的锚点，turn_id 回填为自己；assistant / 工具行由调用方传入同一个 id
-    if role == "user" and turn_id is None:
-        message.turn_id = message.id
 
     for call in tool_calls or []:
         db.add(
@@ -198,6 +205,8 @@ async def load_messages(
     """取会话内最近 limit 条消息，按时间正序返回。
 
     before_id 用于前端上滚翻页：只取 id 小于它的消息。
+    已摘要消息（is_summary=true）仍返回——用户翻历史能看到原文；
+    对话上下文由 app.context.history 过滤，不在这里处理。
     """
     conds = [ChatMessage.session_id == session_id]
     if before_id is not None:
@@ -210,6 +219,25 @@ async def load_messages(
         .limit(max(1, limit))
     )
     return list(reversed(rows.all()))  # 取最新 N 条后转回时间正序
+
+
+async def load_unsummarized_messages(
+    db: AsyncSession, session_id: int
+) -> Sequence[ChatMessage]:
+    """读取会话中尚未被摘要覆盖的全部消息（按 id 正序），供历史压缩使用。
+
+    在 SQL 层过滤 is_summary=true，避免把已摘要消息捞出来再在 Python 里丢弃；
+    不设 limit，保证 limit 窗口外的旧轮次也能参与摘要。
+    """
+    rows = await db.scalars(
+        select(ChatMessage)
+        .where(
+            ChatMessage.session_id == session_id,
+            ChatMessage.is_summary.is_(False),
+        )
+        .order_by(ChatMessage.id)
+    )
+    return list(rows.all())
 
 
 async def load_tool_calls(
@@ -226,12 +254,123 @@ async def load_tool_calls(
     return list(rows.all())
 
 
-async def count_messages(db: AsyncSession, session_id: int) -> int:
-    """统计某会话的消息总数"""
-    total = await db.scalar(
-        select(func.count()).select_from(ChatMessage).where(ChatMessage.session_id == session_id)
+async def load_turn_usages(db: AsyncSession, turn_ids: list[int]) -> dict[int, ChatTurn]:
+    """按 id 批量取 turn，供消息接口把 usage 挂到对应助手消息上。"""
+    if not turn_ids:
+        return {}
+    rows = await db.scalars(select(ChatTurn).where(ChatTurn.id.in_(turn_ids)))
+    return {t.id: t for t in rows.all()}
+
+
+async def record_turn_usage(
+    db: AsyncSession,
+    turn_id: int | None,
+    *,
+    usage_events: list[dict],
+    platform: str = "",
+    model: str = "",
+) -> None:
+    """把一轮里多次模型调用的 usage 汇总写到 chat_turns。
+
+    usage_events 是 ChatManager 产出的 usage 事件列表（每段一次调用）。
+    累加值用于计费口径；last_* 取最后一段，表示本轮结束时的上下文快照。
+    """
+    if turn_id is None or not usage_events:
+        return
+    turn = await db.get(ChatTurn, turn_id)
+    if turn is None:
+        return
+
+    valid = [e for e in usage_events if isinstance(e.get("input_tokens"), int)]
+    if not valid:
+        return
+    total_input = sum(e["input_tokens"] for e in valid)
+    total_output = sum(e.get("output_tokens") or 0 for e in valid)
+    last = valid[-1]
+
+    turn.input_tokens = total_input
+    turn.output_tokens = total_output
+    turn.total_tokens = sum(e.get("total_tokens") or 0 for e in valid)
+    turn.last_input_tokens = last["input_tokens"]
+    turn.last_output_tokens = last.get("output_tokens") or 0
+    turn.model_calls = len(valid)
+    if platform:
+        turn.platform = platform
+    if model:
+        turn.model = model
+    # details 取最后一段的（反映最终状态；累加没有意义）
+    if "input_token_details" in last:
+        turn.input_token_details = last["input_token_details"]
+    if "output_token_details" in last:
+        turn.output_token_details = last["output_token_details"]
+
+    await db.commit()
+
+
+async def load_latest_usage_turn(
+    db: AsyncSession, session_id: int
+) -> ChatTurn | None:
+    """取最近一轮带真实上下文快照的 turn；纯数据读取，用量计算在 app.context.usage。"""
+    return await db.scalar(
+        select(ChatTurn)
+        .where(ChatTurn.session_id == session_id, ChatTurn.last_input_tokens > 0)
+        .order_by(ChatTurn.id.desc())
+        .limit(1)
     )
-    return int(total or 0)
+
+
+async def get_summary(db: AsyncSession, session_id: int) -> ChatSummary | None:
+    """取会话摘要；一个会话最多一条。"""
+    return await db.scalar(
+        select(ChatSummary).where(ChatSummary.session_id == session_id)
+    )
+
+
+async def mark_summarized(
+    db: AsyncSession,
+    session_id: int,
+    user_id: int,
+    *,
+    message_ids: set[int],
+    summary: str,
+    model: str = "",
+) -> int:
+    """把已被摘要覆盖的原始消息打 is_summary 标记，并 upsert 会话摘要。
+
+    消息原文保留供用户翻看，但 app.context.history 会过滤它们，不再进对话上下文。
+    同一事务里完成"打标 + 存摘要"，避免中途失败留下半压缩状态。
+    返回打标的消息数，会话不存在返回 -1。
+    """
+    session = await get_session(db, session_id, user_id)
+    if session is None:
+        return -1
+
+    rows = (
+        await db.scalars(
+            select(ChatMessage).where(
+                ChatMessage.session_id == session_id,
+                ChatMessage.id.in_(message_ids),
+            )
+        )
+    ).all()
+    for row in rows:
+        row.is_summary = True
+
+    existing = await get_summary(db, session_id)
+    if existing is None:
+        db.add(
+            ChatSummary(
+                session_id=session_id,
+                content=summary.strip(),
+                model=model,
+            )
+        )
+    else:
+        existing.content = summary.strip()
+        existing.model = model
+
+    await db.commit()
+    return len(rows)
 
 
 async def truncate_last_turn(
@@ -268,48 +407,4 @@ async def truncate_last_turn(
     return len(rows)
 
 
-def to_lc_messages(rows: Sequence[ChatMessage]) -> list[Any]:
-    """把 ORM 消息行转成 langchain 消息对象（惰性导入，未装 langchain 也不影响本模块导入）
 
-    tools 角色跳过：chat_tool_calls 里已经保存了 call_id / result_text / input_json，
-    但本函数只接收 ChatMessage 行，没有把 ChatToolCall 重建成 ToolMessage，
-    也没有还原 AIMessage.tool_calls。孤立的 ToolMessage 缺少配对的 tool_call_id
-    和前置 AIMessage.tool_calls，硬塞会被上游判为非法上下文。
-
-    要恢复完整工具上下文，必须按 segment_id / seq 成对构造：
-    AIMessage(tool_calls=[...]) + ToolMessage(tool_call_id=..., content=...)。
-    """
-    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-
-    mapping = {"user": HumanMessage, "assistant": AIMessage, "system": SystemMessage}
-    out: list[Any] = []
-    for row in rows:
-        cls = mapping.get(row.role)
-        if cls is None:
-            continue
-        out.append(cls(content=row.content))
-    return out
-
-
-async def load_history(
-    db: AsyncSession,
-    session_id: int,
-    *,
-    limit: int = DEFAULT_HISTORY_LIMIT,
-    before_id: int | None = None,
-) -> list[Any]:
-    """读会话历史并转成 langchain 消息列表，可直接用于 create_agent / model.ainvoke"""
-    return to_lc_messages(await load_messages(db, session_id, limit=limit, before_id=before_id))
-
-
-async def get_recent_session(
-    db: AsyncSession, user_id: int, *, status: str = "active"
-) -> ChatSession | None:
-    """取用户最近活跃的一个会话（前端「继续上次对话」用）"""
-    rows = await db.scalars(
-        select(ChatSession)
-        .where(ChatSession.user_id == user_id, ChatSession.status == status)
-        .order_by(ChatSession.updated_at.desc(), ChatSession.id.desc())
-        .limit(1)
-    )
-    return rows.first()

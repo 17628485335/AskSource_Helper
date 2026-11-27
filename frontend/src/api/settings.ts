@@ -3,6 +3,7 @@
  */
 
 import { ApiError, ensureFreshToken, getToken, request } from './auth'
+import { NETWORK_ERROR_MESSAGE } from '../constants/messages'
 
 export interface ModelProviderOption {
   value: string
@@ -18,6 +19,7 @@ export interface LlmProviderDto {
   base_url: string
   api_key: string
   default_model: string
+  context_size: number
   supports_thinking: boolean
   is_active: boolean
 }
@@ -28,7 +30,7 @@ export async function getModelProviders(): Promise<ModelProviderOption[]> {
   try {
     res = await fetch('/settings/model-providers')
   } catch {
-    throw new Error('无法连接服务器，请确认后端已启动')
+    throw new Error(NETWORK_ERROR_MESSAGE)
   }
   if (!res.ok) {
     throw new Error(`获取模型提供商失败 (${res.status})`)
@@ -52,7 +54,7 @@ async function llmRequest<T>(path: string, options: RequestInit = {}): Promise<T
       },
     })
   } catch {
-    throw new ApiError(0, '无法连接服务器，请确认后端已启动')
+    throw new ApiError(0, NETWORK_ERROR_MESSAGE)
   }
   const text = await res.text()
   const data = text ? JSON.parse(text) : null
@@ -83,6 +85,8 @@ export interface ChatModelOption {
   platform_label: string
   model: string
   name: string
+  /** 该行配置的上下文窗口（token），对话下拉里展示为 200K / 1M */
+  context_size: number
   supports_thinking: boolean
   is_active: boolean
   /** 该行是否真的建进了模型池；false 表示配置还在表里但构建失败，下拉里该置灰 */
@@ -367,7 +371,6 @@ export function generateContextContent(
 export function composeSystemPrompt(payload: {
   prompt: string
   agent_id?: number | null
-  tool_names?: string[] | null
 }): Promise<ContextGenerateResult> {
   return request<ContextGenerateResult>('/context/compose-system-prompt', {
     method: 'POST',

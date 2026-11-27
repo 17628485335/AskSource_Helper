@@ -36,7 +36,6 @@ class AgentContext:
     model: str
     thinking: bool
     tool_names: list[str] | None
-    prompt_hash: str = ""
 
 
 def _agent_out(agent: Agent) -> AgentOut:
@@ -239,7 +238,6 @@ async def resolve_agent(db: AsyncSession, agent_key: str) -> AgentContext:
         agent_key=agent.agent_key,
         prompt_version=prompt.version if prompt else None,
         system_prompt=prompt.system_prompt if prompt else None,
-        prompt_hash=prompt.prompt_hash if prompt else "",
         platform=agent.platform,
         model=agent.model,
         thinking=agent.thinking,

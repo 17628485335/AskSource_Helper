@@ -1,10 +1,99 @@
 @import 'tailwindcss';
 
-/* 全局基础：柔和浅米黄底、细滚动条 */
+/* 主题：Tailwind 的 stone 色阶与 white/black 全部指向运行时变量。
+   深色模式把色阶反转，既有 stone 系列背景、文字和边框类自动换肤，
+   不用逐个组件加 dark: 前缀。data-theme 由 stores/theme.ts 写在 html 上。 */
+@theme inline {
+  --color-white: var(--c-white);
+  --color-black: var(--c-black);
+  --color-stone-50: var(--c-stone-50);
+  --color-stone-100: var(--c-stone-100);
+  --color-stone-200: var(--c-stone-200);
+  --color-stone-300: var(--c-stone-300);
+  --color-stone-400: var(--c-stone-400);
+  --color-stone-500: var(--c-stone-500);
+  --color-stone-600: var(--c-stone-600);
+  --color-stone-700: var(--c-stone-700);
+  --color-stone-800: var(--c-stone-800);
+  --color-stone-900: var(--c-stone-900);
+  --color-stone-950: var(--c-stone-950);
+}
+
 :root {
+  --c-white: #ffffff;
+  --c-black: #000000;
+  --c-stone-50: #fafaf9;
+  --c-stone-100: #f5f5f4;
+  --c-stone-200: #e7e5e4;
+  --c-stone-300: #d6d3d1;
+  --c-stone-400: #a8a29e;
+  --c-stone-500: #78716c;
+  --c-stone-600: #57534e;
+  --c-stone-700: #44403c;
+  --c-stone-800: #292524;
+  --c-stone-900: #1c1917;
+  --c-stone-950: #0c0a09;
+
   --page-bg: #f5f1e8;
   --card-border: #e7e2d5;
+  --scroll-thumb: #dcd5c4;
+  --scroll-thumb-hover: #c9c0ab;
 }
+
+:root[data-theme='dark'] {
+  --c-white: #1c1917;
+  --c-black: #fafaf9;
+  --c-stone-50: #1c1917;
+  --c-stone-100: #292524;
+  --c-stone-200: #44403c;
+  --c-stone-300: #57534e;
+  --c-stone-400: #78716c;
+  --c-stone-500: #a8a29e;
+  --c-stone-600: #d6d3d1;
+  --c-stone-700: #e7e5e4;
+  --c-stone-800: #f5f5f4;
+  --c-stone-900: #fafaf9;
+  --c-stone-950: #ffffff;
+
+  --page-bg: #0c0a09;
+  --card-border: #44403c;
+  --scroll-thumb: #44403c;
+  --scroll-thumb-hover: #57534e;
+}
+
+/* 少数历史遗留的任意值颜色（品牌棕/米色）在深色下需要反转，否则文字会糊在背景里 */
+:root[data-theme='dark'] .text-\[\#2b2a22\],
+:root[data-theme='dark'] .text-\[\#333228\] { color: #f5f5f4; }
+:root[data-theme='dark'] .text-\[\#3f3d30\],
+:root[data-theme='dark'] .text-\[\#4b4938\],
+:root[data-theme='dark'] .text-\[\#4a4838\] { color: #e7e5e4; }
+:root[data-theme='dark'] .text-\[\#5b5945\] { color: #d6d3d1; }
+:root[data-theme='dark'] .text-\[\#6d6a52\],
+:root[data-theme='dark'] .text-\[\#7d7a60\],
+:root[data-theme='dark'] .text-\[\#7a7561\],
+:root[data-theme='dark'] .text-\[\#8a8666\],
+:root[data-theme='dark'] .text-\[\#8a8872\] { color: #a8a29e; }
+:root[data-theme='dark'] .text-\[\#a4a190\] { color: #78716c; }
+
+:root[data-theme='dark'] .bg-\[\#F7F3E4\],
+:root[data-theme='dark'] .bg-\[\#F7F3E9\],
+:root[data-theme='dark'] .bg-\[\#F5F1E8\],
+:root[data-theme='dark'] .bg-\[\#F5F1E3\],
+:root[data-theme='dark'] .bg-\[\#F2EDE1\],
+:root[data-theme='dark'] .bg-\[\#F1EBD9\],
+:root[data-theme='dark'] .bg-\[\#F0EBDA\],
+:root[data-theme='dark'] .bg-\[\#F7EDD3\] { background-color: #292524; }
+:root[data-theme='dark'] .bg-\[\#EDE7D2\],
+:root[data-theme='dark'] .bg-\[\#EAE5D3\],
+:root[data-theme='dark'] .bg-\[\#E6E0CC\],
+:root[data-theme='dark'] .bg-\[\#EBE8C9\] { background-color: #44403c; }
+:root[data-theme='dark'] .bg-\[\#D8D2BC\],
+:root[data-theme='dark'] .bg-\[\#DAD6BE\],
+:root[data-theme='dark'] .bg-\[\#cfc6ae\] { background-color: #57534e; }
+
+:root[data-theme='dark'] .border-\[\#EDE7D2\],
+:root[data-theme='dark'] .border-\[\#EAE5D3\],
+:root[data-theme='dark'] .border-\[\#D8D2BC\] { border-color: #44403c; }
 
 html,
 body,
@@ -29,16 +118,16 @@ body {
   height: 6px;
 }
 .scroll-thin::-webkit-scrollbar-thumb {
-  background: #dcd5c4;
+  background: var(--scroll-thumb);
   border-radius: 9999px;
 }
 .scroll-thin::-webkit-scrollbar-thumb:hover {
-  background: #c9c0ab;
+  background: var(--scroll-thumb-hover);
 }
 .scroll-thin::-webkit-scrollbar-track {
   background: transparent;
 }
 .scroll-thin {
   scrollbar-width: thin;
-  scrollbar-color: #dcd5c4 transparent;
+  scrollbar-color: var(--scroll-thumb) transparent;
 }

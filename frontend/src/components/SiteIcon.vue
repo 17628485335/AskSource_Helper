@@ -1,18 +1,10 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { parseHttpUrl } from '../utils/url'
 
 const props = withDefaults(defineProps<{ url: string; size?: number }>(), { size: 16 })
 
-const parsed = computed(() => {
-  try {
-    const u = new URL(props.url)
-    if (!/^https?:$/.test(u.protocol)) return null
-    return u
-  } catch {
-    return null
-  }
-})
-
+const parsed = computed(() => parseHttpUrl(props.url))
 const host = computed(() => parsed.value?.hostname.replace(/^www\./, '') || '')
 const origin = computed(() => parsed.value?.origin || '')
 const initial = computed(() => host.value.charAt(0).toUpperCase() || '?')

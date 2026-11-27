@@ -69,7 +69,8 @@ def recorded(monkeypatch):
 
     async def fake_append(db, sid, uid, *, role, content, **_kw):
         saved.append((role, content, _kw.get("tool_calls"), _kw.get("turn_id")))
-        return SimpleNamespace(id=99)  # 模拟 user 消息 id，供 turn_id 断言
+        # 模拟 user 消息：turn_id 由 append_message 创建的 chat_turn 提供
+        return SimpleNamespace(id=99, turn_id=77)
 
     async def fake_get_session(db, sid, uid):
         return SimpleNamespace(id=sid)
@@ -83,7 +84,7 @@ def recorded(monkeypatch):
 
     monkeypatch.setattr(chat_service.session_service, "append_message", fake_append)
     monkeypatch.setattr(chat_service.session_service, "get_session", fake_get_session)
-    monkeypatch.setattr(chat_service.session_service, "load_history", fake_load_history)
+    monkeypatch.setattr(chat_service, "load_history", fake_load_history)
     monkeypatch.setattr(chat_service.agent_service, "resolve_agent", fake_resolve)
     return saved
 
@@ -139,12 +140,12 @@ def test_full_answer_is_persisted_once(recorded, monkeypatch):
         ("assistant", "完整回答"),
     ]
     assistant_row = recorded[-1]
-    assert assistant_row[3] == 99, "assistant 行应回指本轮 user 消息 id"
+    assert assistant_row[3] == 77, "assistant 行应回指本轮 chat_turn id"
     assert assistant_row[2] == [], "没有工具调用时不应写工具行"
 
 
 class _ToolAgent(_StubAgent):
-    """一次工具调用后再来一轮模型：验证工具调用字段与其 segment_id"""
+    """一次工具调用后再来一轮模型：验证工具调用字段落库"""
 
     async def stream(self, history, *, system_prompt=None, thinking=False):
         yield {"type": "segment_start", "segment_id": 1}
@@ -172,7 +173,7 @@ class _ToolAgent(_StubAgent):
 
 
 def test_tool_call_is_persisted_in_its_own_table(recorded, monkeypatch):
-    """工具调用（参数 / call_id / 结果 / 耗时 / 引用）单独落库，并标记所属模型轮次"""
+    """工具调用（参数 / call_id / 结果 / 耗时 / 引用）单独落库"""
     _use_agent(monkeypatch, _ToolAgent())
 
     async def run():
@@ -187,14 +188,13 @@ def test_tool_call_is_persisted_in_its_own_table(recorded, monkeypatch):
     assert events[-1]["content"] == "先查一下最终答案"
 
     assistant_row = recorded[-1]
-    assert assistant_row[3] == 99
+    assert assistant_row[3] == 77
     tool_calls = assistant_row[2]
     assert tool_calls is not None
     assert len(tool_calls) == 1
 
     tool = tool_calls[0]
     assert tool["seq"] == 1
-    assert tool["segment_id"] == 1
     assert tool["tool_name"] == "web_search"
     assert tool["call_id"] == "call_w"
     assert tool["input"] == {"query": "python"}

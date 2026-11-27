@@ -8,16 +8,13 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents import service as agent_service
-from app.chat.chat_manager import ChatConfigError, ChatManager
-from app.graph import list_tool_specs
-from app.prompt import build_system_prompt, strip_legacy_default_prompt
+from app.chat.chat_manager import ChatConfigError
 from auth.database import get_db
 from auth.deps import get_current_admin, get_current_user
 from auth.models import User
 
+from . import composer
 from . import service as context_service
-from .assembler import build_skills_snapshot
-from .generator import generate_context_content
 from .schemas import (
     AgentContextBindingCreate,
     ContextGenerateRequest,
@@ -286,17 +283,10 @@ async def generate_context(
     db: AsyncSession = Depends(get_db),
 ) -> ContextGenerateResponse:
     try:
-        if payload.agent_id is not None:
-            agent = await agent_service.get_agent(db, payload.agent_id)
-            platform, model = agent.platform, agent.model
-        else:
-            ctx = await agent_service.resolve_agent(db, "chat")
-            platform, model = ctx.platform, ctx.model
-        pool = await ChatManager.get(db)
-        model_agent = pool.pick(platform=platform, model=model)
-        content = await generate_context_content(
-            model_agent.chat_model,
-            payload.kind,
+        content = await composer.generate_section_content(
+            db,
+            agent_id=payload.agent_id,
+            kind=payload.kind,
             current=payload.current,
             hint=payload.hint,
             variant=payload.variant,
@@ -323,51 +313,17 @@ async def compose_system_prompt(
     current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ) -> SystemPromptComposeResponse:
-    """按 Agent 预设保存的 binding 顺序拼提示词，并把对应内容写进各分段下面。
-
-    不调用 build_context：这里直接从 binding 引用的 doc / 生成器 / memory 取内容，
-    复用的是 build_system_prompt 的拼装规则。
-    """
-    base = strip_legacy_default_prompt(payload.prompt)
-    tool_names = payload.tool_names
-    all_tools = [spec.name for spec in list_tool_specs()]
-    sections: list[tuple[str, str, str, str]] = []
+    """按 Agent 预设保存的 binding 顺序拼提示词；取数与拼装由 composer 负责。"""
     try:
-        if payload.agent_id is not None:
-            agent = await agent_service.get_agent(db, payload.agent_id)
-            if tool_names is None:
-                tool_names = agent.tool_names
-            effective_tools = tool_names if tool_names is not None else all_tools
-            memories = await context_service.list_agent_memories(db, agent.id)
-            for binding in await context_service.list_bindings(db, agent.id):
-                if not binding.enabled:
-                    continue
-                ref_key = binding.ref_key or binding.key
-                content = ""
-                if binding.resolver == "agent_doc":
-                    doc = await context_service.find_agent_doc(db, agent.id, ref_key)
-                    content = doc.content if doc else ""
-                elif binding.resolver == "user_doc":
-                    doc = await context_service.find_user_doc(db, current_user.id, ref_key)
-                    content = doc.content if doc else ""
-                elif binding.resolver == "generated":
-                    content = build_skills_snapshot(effective_tools)
-                elif binding.resolver == "memory":
-                    content = "\n".join(
-                        memory.content.strip()
-                        for memory in memories
-                        if memory.enabled and memory.content.strip()
-                    )
-                sections.append(
-                    (binding.key, binding.trust_level, content, binding.trust_hint)
-                )
+        content = await composer.compose_system_prompt(
+            db,
+            prompt=payload.prompt,
+            agent_id=payload.agent_id,
+            user_id=current_user.id,
+        )
     except agent_service.AgentNotFound as exc:
         raise _http_error(exc) from exc
-    if tool_names is None:
-        tool_names = all_tools
-    return SystemPromptComposeResponse(
-        content=build_system_prompt(base, tool_names, sections=sections)
-    )
+    return SystemPromptComposeResponse(content=content)
 
 
 # ---------------- Agent memories ----------------

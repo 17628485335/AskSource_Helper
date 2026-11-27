@@ -10,6 +10,7 @@
  */
 
 import { readonly, ref } from 'vue'
+import { formatTokenCompact } from '../utils/format'
 import {
   getLlmProviders,
   putLlmProviders,
@@ -23,7 +24,21 @@ export interface LlmProviderConfig {
   base_url: string
   api_key: string
   default_model: string
+  context_size: number
   supports_thinking: boolean
+}
+
+/** 内置上下文大小（token）；label 与对话页共用同一套紧凑格式 */
+export const CONTEXT_SIZES = [
+  { value: 200000, label: formatTokenCompact(200000) },
+  { value: 1048576, label: formatTokenCompact(1048576) },
+]
+
+export const DEFAULT_CONTEXT_SIZE = 200000
+
+/** 旧配置里可能有已下线的小窗口值，统一收敛到默认项，避免下拉框显示空白 */
+export function normalizeContextSize(v: number | null | undefined): number {
+  return CONTEXT_SIZES.some((o) => o.value === v) ? (v as number) : DEFAULT_CONTEXT_SIZE
 }
 
 /** 选择平台时预置的名称与默认模型（base_url 已改由后端 /settings/model-providers 提供） */
@@ -76,6 +91,7 @@ function fromDto(dto: LlmProviderDto): LlmProviderConfig {
     base_url: dto.base_url,
     api_key: dto.api_key,
     default_model: dto.default_model,
+    context_size: normalizeContextSize(dto.context_size),
     supports_thinking: dto.supports_thinking,
   }
 }
@@ -88,6 +104,7 @@ function toDto(p: LlmProviderConfig): LlmProviderDto {
     base_url: p.base_url,
     api_key: p.api_key,
     default_model: p.default_model,
+    context_size: normalizeContextSize(p.context_size),
     supports_thinking: p.supports_thinking,
     is_active: p.id === activeId.value,
   }
@@ -145,6 +162,7 @@ function createProvider(platform: LlmProviderConfig['platform'] = 'deepseek'): L
     base_url: '',
     api_key: '',
     default_model: preset.default_model,
+    context_size: DEFAULT_CONTEXT_SIZE,
     supports_thinking: preset.supports_thinking,
   }
 }

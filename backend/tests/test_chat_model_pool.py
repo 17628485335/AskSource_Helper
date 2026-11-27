@@ -348,7 +348,7 @@ def test_stream_drops_stored_system_messages(monkeypatch):
     sent = _sent[0]
     systems = [m for m in sent if isinstance(m, SystemMessage)]
     assert len(systems) == 1, "只该有本轮注入的那一条 system"
-    # 注入时会拼上日期行（compose_system_prompt），只断言以默认提示词开头
+    # 注入的就是调用方/默认提示词，不再二次拼日期；这里断言以默认提示词开头
     assert systems[0].content.startswith(DEFAULT_SYSTEM_PROMPT)
     assert sent[0] is systems[0], "system 必须在上下文头部"
     # 业务消息不能被误删
@@ -361,26 +361,22 @@ def test_stream_drops_stored_system_messages(monkeypatch):
 def test_date_line_uses_beijing_wall_clock():
     """UTC 晚上对应北京次日凌晨，差的就是那一天（模型会把「今天」算错一天）"""
     assert date_line(datetime(2026, 11, 25, 17, 30, tzinfo=timezone.utc)) == (
-        "今天是 2026-11-26 周四（北京时间）。"
+        "<time>今天是 2026-11-26 周四（北京时间）。</time>"
     )
     # 同一个 UTC 钟面再早一小时还在当天：跳日时刻得按北京墙钟算
     assert date_line(datetime(2026, 11, 25, 15, 59, tzinfo=timezone.utc)) == (
-        "今天是 2026-11-25 周三（北京时间）。"
+        "<time>今天是 2026-11-25 周三（北京时间）。</time>"
     )
 
 
 def test_compose_prompt_appends_date_without_tool_hints():
     assert compose_system_prompt("你好", now=datetime(2026, 1, 1, tzinfo=LOCAL_TZ)) == (
-        "你好\n\n今天是 2026-01-01 周四（北京时间）。"
+        "你好\n\n<time>今天是 2026-01-01 周四（北京时间）。</time>"
     )
-    # 工具不再触发额外的引用说明
-    assert compose_system_prompt("你好", ["web_search", "read_url"]) == (
-        compose_system_prompt("你好", ["noop"])
-    )
-    assert "[n]" not in compose_system_prompt("你好", ["web_search", "read_url"])
+    assert "[n]" not in compose_system_prompt("你好")
     # 传空串 = 本轮不带系统消息，不能被日期行救回去
-    assert compose_system_prompt("", ["web_search"]) == ""
-    assert compose_system_prompt("   \n", ["web_search"]) == ""
+    assert compose_system_prompt("") == ""
+    assert compose_system_prompt("   \n") == ""
 
 
 class _StubGraph:
@@ -397,24 +393,32 @@ class _StubGraph:
         yield {"event": "on_chat_model_stream", "data": {"chunk": AIMessageChunk(content="ok")}}
 
 
-def test_date_is_computed_per_turn_not_frozen_at_pool_build(monkeypatch):
-    """模型池进程常驻：建池时算死日期，跳天之后所有回答的「今天」都是错的"""
+def test_prompt_from_caller_is_used_verbatim(monkeypatch):
+    """调用方传入的完整提示词（含 <time>）被原样注入，运行时不再二次拼装/改写日期"""
 
     monkeypatch.setattr(chat_manager_module, "build_model", lambda *_a, **_k: _SpyMessagesModel())
     agent = ModelAgent("deepseek", "deepseek-chat", api_key="sk-1", tools=[])
     graph = _StubGraph()
     agent.agent = graph
 
-    async def ask(day: str) -> None:
-        monkeypatch.setattr(chat_manager_module, "date_line", lambda *_a, **_k: f"今天是 {day}（北京时间）。")
-        async for _ in agent.stream([HumanMessage(content="hi")]):
+    prompt_with_date = (
+        f"{DEFAULT_SYSTEM_PROMPT}\n\n"
+        "<time>今天是 2020-01-01 周三（北京时间）。</time>"
+    )
+
+    async def ask() -> None:
+        # 即使 date_line 被换成别的日期，也不能改写调用方传进来的提示词
+        monkeypatch.setattr(
+            chat_manager_module, "date_line",
+            lambda *_a, **_k: "今天是 2021-02-02 周二（北京时间）。",
+        )
+        async for _ in agent.stream(
+            [HumanMessage(content="hi")], system_prompt=prompt_with_date
+        ):
             pass
 
-    asyncio.run(ask("2020-01-01 周三"))
-    asyncio.run(ask("2021-02-02 周二"))
-    assert ["2020-01-01" in p for p in graph.prompts] == [True, False]
-    assert "2021-02-02" in graph.prompts[1]
-    assert graph.prompts[1].startswith(DEFAULT_SYSTEM_PROMPT)
+    asyncio.run(ask())
+    assert graph.prompts == [prompt_with_date]
 
 
 def test_tool_whitelist_none_is_all_empty_is_none():

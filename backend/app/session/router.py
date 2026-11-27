@@ -21,9 +21,13 @@ from auth.database import get_db
 from auth.deps import get_current_user
 from auth.models import User
 
-from . import service
+from app.context import usage as context_usage
 from app.workspace import service as workspace_service
+
+from . import mapper
+from . import service
 from .schemas import (
+    ContextUsageOut,
     HistoryMessage,
     MessageCreate,
     MessageOut,
@@ -31,7 +35,6 @@ from .schemas import (
     SessionOut,
     SessionPage,
     SessionUpdate,
-    ToolCallOut,
 )
 
 # 路径已含 /sessions 前缀，此处不再设 prefix，否则会拼成 /sessions/sessions
@@ -201,15 +204,24 @@ async def read_messages(
     await _owned_session(db, session_id, current_user.id)
     rows = await service.load_messages(db, session_id, limit=limit, before_id=before_id)
     tool_rows = await service.load_tool_calls(db, [r.id for r in rows])
-    tools_by_message: dict[int, list[ToolCallOut]] = {}
-    for tool in tool_rows:
-        tools_by_message.setdefault(tool.message_id, []).append(ToolCallOut.model_validate(tool))
-    return [
-        MessageOut.model_validate(r).model_copy(
-            update={"tool_calls": tools_by_message.get(r.id, [])}
-        )
-        for r in rows
-    ]
+    turns = await service.load_turn_usages(db, [r.turn_id for r in rows if r.turn_id])
+    return mapper.to_message_outs(list(rows), tool_rows, turns)
+
+
+@router.get(
+    "/sessions/{session_id}/context-usage",
+    response_model=ContextUsageOut,
+    summary="查询会话上下文用量",
+)
+async def context_usage(
+    session_id: int,
+    context_size: int = Query(default=200000, ge=1, description="当前模型的上下文窗口 tokens"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ContextUsageOut:
+    """只算未摘要消息 + 摘要：与实际送进模型的上下文口径一致。"""
+    await _owned_session(db, session_id, current_user.id)
+    return ContextUsageOut(**await context_usage.get_context_usage(db, session_id, context_size=context_size))
 
 
 @router.get(
@@ -223,7 +235,7 @@ async def read_history(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[HistoryMessage]:
-    """按时间正序返回 role/content，与 service.load_history 给 chat 的视图一致。"""
+    """按时间正序返回 role/content 精简视图；送进模型的上下文由 app.context.history 组装。"""
     await _owned_session(db, session_id, current_user.id)
     rows = await service.load_messages(db, session_id, limit=limit)
     return [

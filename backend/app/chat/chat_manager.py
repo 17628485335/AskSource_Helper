@@ -52,7 +52,7 @@
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -69,15 +69,11 @@ from app.graph.stream_protocol import (
     ev_reasoning,
     ev_segment_start,
     ev_token,
+    ev_usage,
     ev_tool_end,
     ev_tool_start,
 )
-from app.prompt import (
-    build_system_prompt,
-    date_line,
-    prompt_contains_sections,
-    strip_duplicate_section_headers,
-)
+from app.prompt import build_system_prompt, date_line
 from app.prompt import LOCAL_TZ as LOCAL_TZ  # noqa: F401  兼容测试导入
 from app.settings.llm import build_model, get_llm_settings
 from app.settings.models import LlmProvider
@@ -108,6 +104,44 @@ def _text_of(content: Any) -> str:
                 parts.append(block.get("text") or "")
         return "".join(parts)
     return ""
+
+
+# 历史消息最多占上下文窗口的比例：其余留给系统提示、工具定义和本轮输出
+HISTORY_BUDGET_RATIO = 0.6
+
+
+def _drop_orphan_tool_messages(messages: list[Any]) -> list[Any]:
+    """裁掉没有对应 tool_calls 的 ToolMessage，避免上游报「tool 结果没有调用」"""
+    ids: set[str] = set()
+    for msg in messages:
+        for call in getattr(msg, "tool_calls", None) or []:
+            cid = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
+            if cid:
+                ids.add(cid)
+    return [
+        m
+        for m in messages
+        if not isinstance(m, ToolMessage) or getattr(m, "tool_call_id", "") in ids
+    ]
+
+
+def _trim_history(messages: Sequence[Any], context_size: int) -> list[Any]:
+    """按模型上下文窗口裁剪历史：从最新往前保留，超预算就丢弃更早的轮次。
+
+    这里用字符数/2 做保守粗估：只用于裁剪，刻意不追求与计费口径一致
+    （精确计数在 app.context.token_counter，各家端点分词器不同，粗估更稳）。
+    始终至少保留最后一条消息，避免裁成空历史；孤立的工具结果会被一并剔除。
+    """
+    budget = max(1024, int(context_size * HISTORY_BUDGET_RATIO))
+    kept: list[Any] = []
+    used = 0
+    for msg in reversed(list(messages)):
+        cost = max(1, len(_text_of(getattr(msg, "content", ""))) // 2)
+        if kept and used + cost > budget:
+            break
+        kept.append(msg)
+        used += cost
+    return _drop_orphan_tool_messages(list(reversed(kept)))
 
 
 def _result_of(output: Any) -> str:
@@ -182,14 +216,9 @@ def filter_tools_by_call_limit(
     ]
 
 
-def compose_system_prompt(
-    prompt: str,
-    tool_names: Iterable[str] = (),
-    *,
-    now: datetime | None = None,
-) -> str:
+def compose_system_prompt(prompt: str, *, now: datetime | None = None) -> str:
     """兼容旧调用；实际拼装逻辑在 app.prompt.build_system_prompt。"""
-    return build_system_prompt(prompt, tool_names, now=now, date_line_fn=date_line)
+    return build_system_prompt(prompt, now=now, date_line_fn=date_line)
 
 
 # 池里的索引：(平台, 模型)。一个模型一份图，思考态不在键里
@@ -242,6 +271,7 @@ class ModelAgent:
         model: str,
         *,
         supports_thinking: bool = False,
+        context_size: int = 200000,
         api_key: str = "",
         base_url: str = "",
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
@@ -250,6 +280,7 @@ class ModelAgent:
         self.platform = platform
         self.model_name = model
         self.supports_thinking = supports_thinking
+        self.context_size = context_size
         self.api_key = api_key
         self.base_url = base_url
         self.system_prompt = system_prompt
@@ -323,19 +354,21 @@ class ModelAgent:
         @wrap_model_call
         async def select_thinking(request: Any, handler: Any) -> Any:
             next_request = request
-            context = request.runtime.context if request.runtime else None
-            thinking = bool(isinstance(context, dict) and context.get("thinking"))
+            runtime_context = request.runtime.context if request.runtime is not None else None
+            context = runtime_context if isinstance(runtime_context, Mapping) else {}
+            thinking = bool(context.get("thinking"))
             if thinking and self.thinking_model is not None:
                 next_request = next_request.override(model=self.thinking_model)
 
-            tool_names = context.get("tool_names") if isinstance(context, dict) else None
+            tool_names = context.get("tool_names")
+            current_tools = list(next_request.tools or [])
             if tool_names is not None or tool_limits:
-                allowed = filter_tools_by_names(next_request.tools, tool_names)
+                allowed = filter_tools_by_names(current_tools, tool_names)
                 if tool_limits:
                     allowed = filter_tools_by_call_limit(
                         allowed, next_request.messages, tool_limits
                     )
-                if len(allowed) != len(next_request.tools):
+                if allowed != current_tools:
                     next_request = next_request.override(tools=allowed)
 
             return await handler(next_request)
@@ -375,7 +408,6 @@ class ModelAgent:
         system_prompt: str | None = None,
         thinking: bool = False,
         tool_names: Sequence[str] | None = None,
-        context_messages: Sequence[Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """只发起一次 astream_events(v2)，把图事件逐个翻译成协议事件：
         产出 segment_start* / token* / reasoning* / tool_start* / tool_end* / citations*。
@@ -392,7 +424,6 @@ class ModelAgent:
         thinking 走 context 交给图里的中间件：True 且该行支持深度思考时才换成深度态模型
         （实测 astream_events 的 context kwarg 原样到达 request.runtime.context）。
         tool_names 同理：None=模型池全部工具，[]=禁用所有工具，列表=只给白名单。
-        context_messages 是 Phase 4 装配出的上下文段，紧跟系统提示词、位于历史之前。
 
         reasoning 是思考增量（只在深度档出现），来自 ReasoningChatOpenAI 接住的
         reasoning_content，与正文 token 分事件下发，不进回答文本也不落库。
@@ -403,6 +434,8 @@ class ModelAgent:
         由 service 从 tool_start / tool_end 收集，独立落到 chat_tool_calls 表。
 
         system_prompt 省略时回落到 self.system_prompt，传空串表示本轮不带系统消息。
+        调用方传入的是管理端已拼好的完整提示词（含 <time> 日期），这里直接使用，
+        不再二次拼装、也不改写日期。
         图里没有系统消息，所以每轮把它置于历史最前 —— 上游要求 system 在上下文头部。
         历史里已有的 system 行会被丢掉：/sessions/{id}/messages 允许写 system 角色，
         留着就是两条 system 且一条不在头部，部分 OpenAI 兼容上游会直接 400。
@@ -415,36 +448,11 @@ class ModelAgent:
         announced: set[str] = set()
         pending: dict[str, dict[str, Any]] = {}
         segment_id = 0
-        visible_tool_names = (
-            list(tool_names)
-            if tool_names is not None
-            else [getattr(tool, "name", "") for tool in self.tools]
-        )
-        prompt = build_system_prompt(
-            self.system_prompt if system_prompt is None else system_prompt,
-            visible_tool_names,
-            date_line_fn=date_line,
-        )
+        prompt = self.system_prompt if system_prompt is None else system_prompt
         turns = [m for m in history if not isinstance(m, SystemMessage)]
-        context_blocks = list(context_messages or [])
-        # 生成后的系统提示词已含完整分段正文，就不再重复注入分段；
-        # 只带标签但缺正文时，仅去掉重复表头，保留上下文正文。
-        if prompt and context_blocks:
-            block_text = "\n".join(str(getattr(m, "content", "")) for m in context_blocks)
-            if prompt_contains_sections(prompt, block_text):
-                context_blocks = []
-        if prompt and context_blocks:
-            rewritten: list[Any] = []
-            for message in context_blocks:
-                if isinstance(message, SystemMessage):
-                    original = str(getattr(message, "content", ""))
-                    cleaned = strip_duplicate_section_headers(original, prompt)
-                    if cleaned != original:
-                        message = SystemMessage(content=cleaned)
-                rewritten.append(message)
-            context_blocks = rewritten
+        turns = _trim_history(turns, getattr(self, "context_size", 200000))
         head = [SystemMessage(content=prompt)] if prompt else []
-        messages = [*head, *context_blocks, *turns]
+        messages = [*head, *turns]
         async for ev in self.agent.astream_events(
             {"messages": messages},
             version="v2",
@@ -477,6 +485,11 @@ class ModelAgent:
                 # （模型流里的 tool_call_chunks 把 args 切成碎片、on_tool_start 又没有 tool_call_id），
                 # 故 tool_start 从这里发。工具执行紧贴在本事件之后，徽标不会因此迟亮。
                 out = (ev.get("data") or {}).get("output")
+                # usage_metadata 也是此刻才齐备（流式 chunk 的 usage 已由 langchain 聚合）；
+                # 上游不返回时为空，service 会回退到估算，不把它当错误。
+                usage = getattr(out, "usage_metadata", None)
+                if usage:
+                    yield ev_usage(usage, segment_id=segment_id)
                 for call in getattr(out, "tool_calls", None) or []:
                     name = call.get("name") or ""
                     call_id = call.get("id") or ""
@@ -548,8 +561,6 @@ class ChatManager:
         self.default_key = default_key
         # 构建失败的行，只用于排查；对话报错时也会带出第一条
         self.errors = errors or []
-        # agent_key -> (prompt_hash, system_prompt)；每轮与库里 hash 对比，变了才刷新
-        self.prompt_cache: dict[str, tuple[str, str]] = {}
         # 整池共用的一份工具（建池时 load_tools 取一次）；每个 ModelAgent 的图都用它
         self.tools = list(tools) if tools is not None else []
         # 工具加载失败的那一句。单独存而不挤进 errors：那是代码问题，
@@ -607,6 +618,7 @@ class ChatManager:
                     platform,
                     model,
                     supports_thinking=row.supports_thinking,
+                    context_size=getattr(row, "context_size", 200000) or 200000,
                     api_key=row.api_key,
                     base_url=row.base_url,
                     tools=tools,

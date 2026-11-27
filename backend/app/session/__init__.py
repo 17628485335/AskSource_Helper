@@ -1,7 +1,10 @@
-"""Session 会话模块：会话与消息落库（MySQL）+ 查询接口 + 对话历史函数"""
+"""Session 会话模块：会话与消息落库（MySQL）+ 查询接口。
+
+router 由 app.main 从 .session.router 显式挂载；包初始化只导出数据层与模型，
+避免把 router 的依赖链带进其它模块的导入路径。
+"""
 
 from .models import ChatMessage, ChatSession
-from .router import router
 from .schemas import (
     HistoryMessage,
     MessageCreate,
@@ -14,15 +17,17 @@ from .schemas import (
 from .service import (
     DEFAULT_HISTORY_LIMIT,
     append_message,
-    count_messages,
     create_session,
+    get_summary,
+    load_latest_usage_turn,
+    load_turn_usages,
+    mark_summarized,
+    record_turn_usage,
     delete_session,
-    get_recent_session,
     get_session,
     list_sessions,
-    load_history,
+    load_unsummarized_messages,
     load_messages,
-    to_lc_messages,
     update_session,
 )
 
@@ -46,10 +51,11 @@ __all__ = [
     "update_session",
     "delete_session",
     "append_message",
+    "get_summary",
+    "load_latest_usage_turn",
+    "load_turn_usages",
+    "mark_summarized",
+    "record_turn_usage",
+    "load_unsummarized_messages",
     "load_messages",
-    "load_history",
-    "count_messages",
-    "to_lc_messages",
-    "get_recent_session",
-    "router",
 ]

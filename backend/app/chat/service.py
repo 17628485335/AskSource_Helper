@@ -32,7 +32,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from app.agents import service as agent_service
-from app.context.assembler import build_context
+from app.context.history import load_history
 from app.session import service as session_service
 from app.workspace import service as workspace_service
 
@@ -47,7 +47,6 @@ async def astream_chat(
     platform: str = "",
     model: str = "",
     thinking: bool | None = None,
-    system_prompt: str | None = None,
     workspace_id: int | None = None,
     regenerate: bool = False,
     agent_key: str | None = None,
@@ -59,16 +58,15 @@ async def astream_chat(
     → citations*（工具返回的引用）)* → done；任何阶段失败都产出 error 事件并结束，
     避免前端干等到超时。事件语义见 graph/stream_protocol.py。
 
-    system_prompt 逐轮生效，不传则用该 ModelAgent 的默认提示词；
-    agent_key 命中 agents 表时，表里的提示词/模型/工具白名单优先于请求值。
+    agent_key 命中 agents 表时，表里的提示词/模型/工具白名单优先于请求值；
+    提示词统一取 agent_prompts 的生效版本。
     thinking 只有在该模型支持深度思考时才生效（不支持时按快速发）。
     """
     from auth.database import AsyncSessionLocal
 
     ctx: agent_service.AgentContext | None = None
     tool_names: list[str] | None = None
-    context_messages: list[Any] = []
-    context_sections: list[str] = []
+    agent_prompt: str | None = None
 
     # 阶段一：解析 agent 配置、挑模型、准备会话与历史
     async with AsyncSessionLocal() as db:
@@ -90,12 +88,7 @@ async def astream_chat(
                 model = ctx.model or model
                 if thinking is None:
                     thinking = ctx.thinking
-                if ctx.system_prompt:
-                    cached = pool.prompt_cache.get(ctx.agent_key)
-                    if cached is None or cached[0] != ctx.prompt_hash:
-                        cached = (ctx.prompt_hash, ctx.system_prompt)
-                        pool.prompt_cache[ctx.agent_key] = cached
-                    system_prompt = cached[1]
+                agent_prompt = ctx.system_prompt
                 tool_names = ctx.tool_names
 
             agent = pool.pick(platform=platform, model=model)
@@ -138,38 +131,31 @@ async def astream_chat(
             sid = created.id
 
         user_message = await session_service.append_message(
-            db, sid, user_id, role="user", content=message
+            db,
+            sid,
+            user_id,
+            role="user",
+            content=message,
+            platform=agent.platform,
+            model=agent.model_name,
         )
-        # 一轮问答的 turn_id 就是这条 user 消息的 id；assistant / tool 行都回指它。
-        turn_id = user_message.id if user_message is not None else None
-        history = await session_service.load_history(db, sid)
-
-        # Phase 4：agent 决定注入哪些段；用户资料只按 user_id 读取，不写进 agent 配置
-        if ctx is not None:
-            try:
-                bundle = await build_context(db, ctx, user_id=user_id, session_id=sid)
-                context_messages = bundle.messages
-                context_sections = bundle.section_keys
-            except Exception:
-                # 上下文装配失败不该让对话不可用；没有上下文段时仍走原模型链路
-                context_messages = []
-                context_sections = []
+        # append_message 已为这条 user 消息创建 chat_turn 行；assistant / 工具行回指同一个 turn_id。
+        turn_id = getattr(user_message, "turn_id", None) if user_message is not None else None
+        history = await load_history(db, sid)
 
     meta_extras: dict[str, Any] = {}
     if ctx is not None:
         meta_extras = {
             "agent_key": ctx.agent_key,
             "prompt_version": ctx.prompt_version,
-            "context_sections": context_sections,
         }
     yield {"type": "meta", "session_id": sid, **agent.descriptor(use_thinking), **meta_extras}
 
     # 阶段二：流式调用模型（不持有数据库连接）
     answer_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
+    usage_events: list[dict[str, Any]] = []
     seq_counter = 0
-    # 只留一个轻量编号，标记工具调用属于第几轮模型调用，不再维护分段正文
-    segment_id = 0
     pending_tools: dict[str, dict[str, Any]] = {}
     persisted = False
 
@@ -185,7 +171,6 @@ async def astream_chat(
     def _new_tool_call(tool: str, call_id: str) -> dict[str, Any]:
         return {
             "seq": _next_seq(),
-            "segment_id": segment_id or None,
             "tool_name": tool,
             "call_id": call_id,
             "input": {},
@@ -228,22 +213,27 @@ async def astream_chat(
                     tool_calls=tool_calls,
                     turn_id=turn_id,
                 )
+                await session_service.record_turn_usage(
+                    db,
+                    turn_id,
+                    usage_events=usage_events,
+                    platform=agent.platform,
+                    model=agent.model_name,
+                )
         return answer
 
     try:
         astream_kwargs: dict[str, Any] = {
-            "system_prompt": system_prompt,
+            "system_prompt": agent_prompt,
             "thinking": use_thinking,
         }
         if tool_names is not None:
             astream_kwargs["tool_names"] = tool_names
-        if context_messages:
-            astream_kwargs["context_messages"] = context_messages
         async for event in agent.astream(history, **astream_kwargs):
             kind = event["type"]
 
-            if kind == "segment_start":
-                segment_id = event.get("segment_id", 0)
+            if kind == "usage":
+                usage_events.append(event)
 
             elif kind == "token":
                 answer_parts.append(event["text"])

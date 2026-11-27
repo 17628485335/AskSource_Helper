@@ -37,6 +37,18 @@ export interface ChatMessage {
   thinking: boolean
   /** 消息产生时刻（ISO）：本地发送取当前时间，历史恢复取后端落库时间 */
   created_at: string
+  /** 本轮 LLM 的 token 用量；实时流由 usage 事件回填，历史从消息接口恢复 */
+  turnUsage: TurnUsage | null
+}
+
+/** token 用量（与后端 TurnUsageOut 对齐） */
+export interface TurnUsage {
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  input_token_details: Record<string, number>
+  output_token_details: Record<string, number>
+  model_calls: number
 }
 
 type Options = Pick<
@@ -88,6 +100,7 @@ function newMessage(
     reasoning: '',
     thinking: false,
     created_at,
+    turnUsage: null,
   }
 }
 
@@ -103,6 +116,20 @@ function applyEvent(event: ChatEvent, bubble: ChatMessage) {
       break
     case 'segment_start':
       // 后端分段落库用的边界；前端仍用一个气泡展示整轮回答，这里无需改状态
+      break
+    case 'usage':
+      // 每段模型调用一帧；累加到本气泡，立即显示用量图标
+      {
+        const prev = bubble.turnUsage
+        bubble.turnUsage = {
+          input_tokens: (prev?.input_tokens ?? 0) + event.input_tokens,
+          output_tokens: (prev?.output_tokens ?? 0) + event.output_tokens,
+          total_tokens: (prev?.total_tokens ?? 0) + event.total_tokens,
+          input_token_details: event.input_token_details,
+          output_token_details: event.output_token_details,
+          model_calls: (prev?.model_calls ?? 0) + 1,
+        }
+      }
       break
     case 'token':
       bubble.content += event.text
@@ -232,6 +259,16 @@ async function loadSession(
           })
         }
         msg.citations.sort((a, b) => a.index - b.index)
+        if (r.turn_usage) {
+          msg.turnUsage = {
+            input_tokens: r.turn_usage.input_tokens,
+            output_tokens: r.turn_usage.output_tokens,
+            total_tokens: r.turn_usage.total_tokens,
+            input_token_details: r.turn_usage.input_token_details ?? {},
+            output_token_details: r.turn_usage.output_token_details ?? {},
+            model_calls: r.turn_usage.model_calls,
+          }
+        }
       }
       return msg
     })
