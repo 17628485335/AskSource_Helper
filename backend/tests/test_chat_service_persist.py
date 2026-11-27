@@ -1,4 +1,4 @@
-"""stream_chat 的落库时机测试（不连 MySQL，也不发网络请求）
+"""astream_chat 的落库时机测试（不连 MySQL，也不发网络请求）
 
 守的是「别把会话留在只有一半的状态」：客户端中途断开（router 的 keepalive 会 cancel
 上游）或上游报错时，已经吐出来的字也要入库。只在正常遍历结束时写会留下一轮只有 user、
@@ -90,7 +90,7 @@ def recorded(monkeypatch):
 
 
 def _use_agent(monkeypatch, agent):
-    """让 stream_chat 挑到指定的 ModelAgent 替身（池本身不参与本测试）"""
+    """让 astream_chat 挑到指定的 ModelAgent 替身（池本身不参与本测试）"""
 
     async def fake_get(_db):
         return SimpleNamespace(pick=lambda **_kw: agent)
@@ -103,7 +103,7 @@ def test_partial_answer_is_saved_when_client_disconnects(recorded, monkeypatch):
     _use_agent(monkeypatch, _StubAgent(hang=asyncio.Event()))
 
     async def run():
-        gen = chat_service.stream_chat(user_id=1, message="提问", session_id=7)
+        gen = chat_service.astream_chat(user_id=1, message="提问", session_id=7)
         events = []
         async for event in gen:
             events.append(event)
@@ -127,7 +127,7 @@ def test_full_answer_is_persisted_once(recorded, monkeypatch):
     async def run():
         return [
             e
-            async for e in chat_service.stream_chat(
+            async for e in chat_service.astream_chat(
                 user_id=1, message="提问", session_id=7
             )
         ]
@@ -179,7 +179,7 @@ def test_tool_call_is_persisted_in_its_own_table(recorded, monkeypatch):
     async def run():
         return [
             e
-            async for e in chat_service.stream_chat(
+            async for e in chat_service.astream_chat(
                 user_id=1, message="提问", session_id=7
             )
         ]

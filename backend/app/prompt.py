@@ -1,7 +1,8 @@
-"""系统提示词拼装：基础提示词 + 各分段 + 当天日期。
+"""系统提示词拼装：基础提示词 + 各分段。
 
 管理端「生成系统提示词」接口调用它拼出完整提示词并保存；运行时直接使用
-已保存的提示词，不再二次拼装。XML 分块规则见 app.xml_blocks。
+已保存的提示词，不再二次拼装。生成的提示词不再附带当天日期，也不拼接
+trust_hint。XML 分块规则见 app.xml_blocks。
 """
 
 import hashlib
@@ -47,6 +48,7 @@ SECTION_TAGS = {
     "user_profile": "user_profile",
     "long_term_memory": "long_term_memory",
 }
+# 仅用于兼容旧数据/旧调用；生成系统提示词时不再写入 trust_hint
 TRUST_HINTS = {
     "anchor": "事实锚点",
     "policy": "可作为规则遵循",
@@ -57,17 +59,17 @@ _KNOWN_TAGS = set(SECTION_TAGS.values())
 
 
 def section_header(key: str, trust_level: str, hint: str | None = None) -> str:
-    """按 Agent 预设里的分段生成完整 XML 块（只含 hint，不含正文）。
+    """兼容旧签名：返回不带 trust_hint 的空 XML 块。
 
-    优先用 binding 里保存的中文描述；老数据没有时回退到 trust_level 映射。
+    生成系统提示词时只写正文，不再把信任提示拼进提示词。
     """
+    del trust_level, hint
     tag = SECTION_TAGS.get(key, key.lower())
-    text = (hint or "").strip() or TRUST_HINTS.get(trust_level, "上下文")
-    return xml_block(tag, text)
+    return xml_block(tag)
 
 
 def date_line(now: datetime | None = None) -> str:
-    """`<time>今天是 YYYY-MM-DD 周X（北京时间）。</time>` 每轮现拼，避免日期过期。"""
+    """旧版兼容辅助：生成 `<time>今天是 ...（北京时间）。</time>`；新提示词不再追加。"""
     moment = (now or datetime.now(LOCAL_TZ)).astimezone(LOCAL_TZ)
     text = f"今天是 {moment:%Y-%m-%d} {_WEEKDAYS[moment.weekday()]}（北京时间）。"
     return xml_block("time", text, inline=True)
@@ -131,28 +133,24 @@ def build_system_prompt(
     now: datetime | None = None,
     date_line_fn=None,
 ) -> str:
-    """把按预设顺序排列的分段和当天日期拼到基础提示词后。
+    """把按预设顺序排列的分段拼到基础提示词后，不拼接日期或 trust_hint。
 
-    日期放在最后：它每天变化，放前面会让稳定前缀缓存失效。
-    `sections` 传 (key, trust_level, content, hint)，顺序由调用方按已保存的
-    priority 排好；每段写成 `<tag>` 包裹的块，hint 是 binding 里保存的中文描述，
+    `sections` 仍按旧签名传 (key, trust_level, content, hint)，顺序由调用方按
+    priority 排好；每段只把正文写进 `<tag>` 块，trust_level / hint 不再进入提示词，
     各段之间空行分隔。函数幂等：传入已拼好的提示词会先去掉旧后缀再按当前状态重拼。
-    基础提示词为空但仍传了 sections 时，只生成分段和日期；两者都为空时返回空串。
-    date_line_fn 仅用于测试注入；正常调用不需要传。
+    基础提示词为空但仍传了 sections 时，只生成有正文的分段；两者都为空时返回空串。
+    `now` / `date_line_fn` 仅为兼容旧调用保留，已不再参与拼装。
     """
     base = _strip_composed_suffix(prompt or "")
     section_list = list(sections or [])
     if not base.strip() and not section_list:
         return ""
-    make_date_line = date_line_fn or date_line
 
     blocks = [base] if base.strip() else []
-    for key, trust, content, hint in section_list:
+    for key, _trust, content, _hint in section_list:
+        body = (content or "").rstrip()
+        if not body.strip():
+            continue
         tag = SECTION_TAGS.get(key, key.lower())
-        text = (hint or "").strip() or TRUST_HINTS.get(trust, "上下文")
-        body = [text]
-        if (content or "").strip():
-            body.append(content.rstrip())
-        blocks.append(xml_block(tag, *body))
-    blocks.append(make_date_line(now))
+        blocks.append(xml_block(tag, body))
     return join_blocks(*blocks)

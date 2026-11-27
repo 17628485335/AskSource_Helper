@@ -169,3 +169,53 @@ def test_wrap_history_without_summary_still_wraps_messages():
 
     assert len(out) == 1
     assert out[0].content == "<messages>\n用户：你好\n\n助手：你好呀\n</messages>"
+
+
+def test_load_history_wraps_summary_as_system_and_rows_as_turns(monkeypatch):
+    """摘要是 XML 块包裹的 SystemMessage；库里的 user/assistant 行逐条返回。"""
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+    rows = [
+        row(1, "user", "你好"),
+        row(2, "assistant", "你好呀"),
+        row(3, "system", "旧提示"),
+        row(4, "tools", "工具结果", tool_name="web_search"),
+    ]
+
+    called = {}
+
+    async def fake_load_messages(_db, _sid, **kwargs):
+        called.update(kwargs)
+        return rows
+
+    async def fake_get_summary(_db, _sid):
+        return SimpleNamespace(content="用户偏好简洁回答")
+
+    monkeypatch.setattr(history_module.session_service, "load_messages", fake_load_messages)
+    monkeypatch.setattr(history_module.session_service, "get_summary", fake_get_summary)
+
+    out = asyncio.run(history_module.load_history(object(), 1))
+
+    assert called == {"limit": None, "before_id": None}
+    assert [type(message) for message in out] == [SystemMessage, HumanMessage, AIMessage]
+    assert out[0].content == "<message_summary>\n用户偏好简洁回答\n</message_summary>"
+    assert [message.content for message in out[1:]] == ["你好", "你好呀"]
+
+
+def test_load_history_before_id_skips_summary(monkeypatch):
+    """翻页只取更早的消息，不查摘要，也不带 SystemMessage。"""
+    from langchain_core.messages import HumanMessage
+
+    async def fake_load_messages(_db, _sid, **_kwargs):
+        return [row(1, "user", "更早的问题")]
+
+    async def fake_get_summary(_db, _sid):
+        raise AssertionError("before_id 时不应查询摘要")
+
+    monkeypatch.setattr(history_module.session_service, "load_messages", fake_load_messages)
+    monkeypatch.setattr(history_module.session_service, "get_summary", fake_get_summary)
+
+    out = asyncio.run(history_module.load_history(object(), 1, before_id=99))
+
+    assert [type(message) for message in out] == [HumanMessage]
+    assert out[0].content == "更早的问题"

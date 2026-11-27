@@ -85,7 +85,7 @@ export interface ChatModelOption {
   platform_label: string
   model: string
   name: string
-  /** 该行配置的上下文窗口（token），对话下拉里展示为 200K / 1M */
+  /** 该行配置的上下文窗口（token），对话下拉里展示为 200K / 1000K */
   context_size: number
   supports_thinking: boolean
   is_active: boolean

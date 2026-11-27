@@ -43,7 +43,7 @@
   导入该包即完成注册（见上方 import app.tools）；注册表在 app/graph/tools.py。
 - 分层：ModelAgent 只管模型态与「问模型」——  stream() 直接消费 astream_events(v2)，
   用 graph.stream_protocol 的 ev_* 工厂产出 segment_start/token/reasoning/tool_start/tool_end/citations；
-  会话归属、消息落库、取历史、meta/done/error 编排全部在 service.stream_chat()。
+  会话归属、消息落库、取历史、meta/done/error 编排全部在 service.astream_chat()。
   那边分三段各自开关数据库会话（一次流式回答可能挂数十秒，全程持有请求级 db 会话
   会长时间占用连接池连接，并发稍高就耗尽。实测 FastAPI 注入的 db 在流式期间仍存活，
   所以这是资源占用问题，不是 correctness 问题。）
@@ -78,6 +78,7 @@ from app.prompt import LOCAL_TZ as LOCAL_TZ  # noqa: F401  兼容测试导入
 from app.settings.llm import build_model, get_llm_settings
 from app.settings.models import LlmProvider
 from app.tools.citations import extract_citations
+from app.xml_blocks import join_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +218,7 @@ def filter_tools_by_call_limit(
 
 
 def compose_system_prompt(prompt: str, *, now: datetime | None = None) -> str:
-    """兼容旧调用；实际拼装逻辑在 app.prompt.build_system_prompt。"""
+    """兼容旧调用；`now` 保留旧签名，实际拼装不再追加日期。"""
     return build_system_prompt(prompt, now=now, date_line_fn=date_line)
 
 
@@ -373,10 +374,15 @@ class ModelAgent:
 
             return await handler(next_request)
 
+        @wrap_model_call
+        async def dump_llm_messages(request: Any, handler: Any) -> Any:
+            """空实现：仅保留 middleware 挂载点，方便 debug 时在此打断点。"""
+            return await handler(request)
+
         return create_agent(
             model=self.chat_model,
             tools=self.tools,
-            middleware=[select_thinking],
+            middleware=[select_thinking, dump_llm_messages],
             context_schema=dict,
         )
 
@@ -418,7 +424,7 @@ class ModelAgent:
         on_chat_model_start 是分段边界：一次流式回答里模型可能被调用多轮（工具执行后再来一轮），
         每轮开一个 segment，segment_id 从 1 递增。service 后续按 segment 分段落库。
 
-        不碰数据库、不管会话与落库（那些在 service.stream_chat()），异常也原样抛出，
+        不碰数据库、不管会话与落库（那些在 service.astream_chat()），异常也原样抛出，
         由调用方转成 error 事件。
 
         thinking 走 context 交给图里的中间件：True 且该行支持深度思考时才换成深度态模型
@@ -434,10 +440,9 @@ class ModelAgent:
         由 service 从 tool_start / tool_end 收集，独立落到 chat_tool_calls 表。
 
         system_prompt 省略时回落到 self.system_prompt，传空串表示本轮不带系统消息。
-        调用方传入的是管理端已拼好的完整提示词（含 <time> 日期），这里直接使用，
-        不再二次拼装、也不改写日期。
-        图里没有系统消息，所以每轮把它置于历史最前 —— 上游要求 system 在上下文头部。
-        历史里已有的 system 行会被丢掉：/sessions/{id}/messages 允许写 system 角色，
+        调用方传入的是管理端已拼好的完整提示词，这里直接使用，不再二次拼装。
+        带 <message_summary> 的历史摘要 SystemMessage 会并入头部 system；
+        其它历史 system 行仍丢掉：/sessions/{id}/messages 允许写 system 角色，
         留着就是两条 system 且一条不在头部，部分 OpenAI 兼容上游会直接 400。
 
         announced / pending 必须是生成器局部状态：同一个实例会被并发请求复用，
@@ -449,9 +454,17 @@ class ModelAgent:
         pending: dict[str, dict[str, Any]] = {}
         segment_id = 0
         prompt = self.system_prompt if system_prompt is None else system_prompt
-        turns = [m for m in history if not isinstance(m, SystemMessage)]
+        head_parts = [prompt] if prompt else []
+        turns: list[Any] = []
+        for message in history:
+            if isinstance(message, SystemMessage):
+                content = str(message.content or "").strip()
+                if content.startswith("<message_summary>"):
+                    head_parts.append(content)
+                continue
+            turns.append(message)
         turns = _trim_history(turns, getattr(self, "context_size", 200000))
-        head = [SystemMessage(content=prompt)] if prompt else []
+        head = [SystemMessage(content=join_blocks(*head_parts))] if head_parts else []
         messages = [*head, *turns]
         async for ev in self.agent.astream_events(
             {"messages": messages},

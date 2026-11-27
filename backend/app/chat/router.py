@@ -20,7 +20,7 @@ from auth.deps import get_current_user
 from auth.schemas import UserOut
 
 from .schemas import ChatRequest
-from .service import stream_chat
+from .service import astream_chat
 
 router = APIRouter(tags=["chat"])
 
@@ -79,7 +79,7 @@ async def _with_keepalive(frames: AsyncIterator[str], idle: float = KEEPALIVE_ID
 
 async def _event_stream(payload: ChatRequest, user_id: int) -> AsyncIterator[str]:
     """把 service 编排出的事件流编成 SSE 帧（会话/落库/调模型都不在这里）"""
-    events = stream_chat(
+    events = astream_chat(
         user_id=user_id,
         message=payload.message,
         session_id=payload.session_id,

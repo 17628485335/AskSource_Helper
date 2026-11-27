@@ -8,6 +8,7 @@
 - POST   /sessions/{id}/messages      追加一条消息（对话落库）
 - GET    /sessions/{id}/messages      完整历史（含 id/tokens，支持上滚翻页）
 - GET    /sessions/{id}/history       精简历史（role/content，拼 prompt 用）
+- POST   /sessions/{id}/compact       手动压缩更早轮次，返回压缩后的上下文用量
 
 跨用户访问统一返回 404，不暴露会话是否存在。
 """
@@ -21,7 +22,9 @@ from auth.database import get_db
 from auth.deps import get_current_user
 from auth.models import User
 
-from app.context import usage as context_usage
+from app.chat.chat_manager import ChatConfigError, ChatManager
+from app.context import usage as context_usage_service
+from app.context.history_compactor import compact_history as compact_history_service
 from app.workspace import service as workspace_service
 
 from . import mapper
@@ -221,7 +224,41 @@ async def context_usage(
 ) -> ContextUsageOut:
     """只算未摘要消息 + 摘要：与实际送进模型的上下文口径一致。"""
     await _owned_session(db, session_id, current_user.id)
-    return ContextUsageOut(**await context_usage.get_context_usage(db, session_id, context_size=context_size))
+    return ContextUsageOut(**await context_usage_service.get_context_usage(db, session_id, context_size=context_size))
+
+
+@router.post(
+    "/sessions/{session_id}/compact",
+    response_model=ContextUsageOut,
+    summary="手动压缩会话历史",
+)
+async def compact_history(
+    session_id: int,
+    context_size: int = Query(default=200000, ge=1, description="当前模型的上下文窗口 tokens"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ContextUsageOut:
+    """把更早轮次摘要化，返回压缩后的最新上下文用量。"""
+    session = await _owned_session(db, session_id, current_user.id)
+    try:
+        pool = await ChatManager.get(db)
+        agent = pool.pick(platform=session.platform, model=session.model)
+        await compact_history_service(
+            db,
+            session_id,
+            user_id=current_user.id,
+            model=agent.chat_model,
+        )
+        # 压缩可能没真正改动历史（轮次不够 / 摘要为空）。只要用户点了压缩，
+        # 旧 turn 的 API 快照就不再代表当前上下文，必须强制回退到估算。
+        await service.invalidate_usage_snapshots(db, session_id)
+        await db.commit()
+    except ChatConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    return ContextUsageOut(**await context_usage_service.get_context_usage(db, session_id, context_size=context_size))
 
 
 @router.get(

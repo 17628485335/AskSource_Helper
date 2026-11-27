@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import ChatMessage, ChatSession, ChatSummary, ChatToolCall, ChatTurn
 
-# 默认只带最近若干轮进 prompt，避免上下文超长
+# 会话接口分页默认上限；上下文组装不再按固定条数截断
 DEFAULT_HISTORY_LIMIT = 20
 # 自动标题截取长度
 AUTO_TITLE_LEN = 30
@@ -199,10 +199,10 @@ async def load_messages(
     db: AsyncSession,
     session_id: int,
     *,
-    limit: int = DEFAULT_HISTORY_LIMIT,
+    limit: int | None = None,
     before_id: int | None = None,
 ) -> Sequence[ChatMessage]:
-    """取会话内最近 limit 条消息，按时间正序返回。
+    """取会话消息，按时间正序返回；默认 limit=None，不截断。
 
     before_id 用于前端上滚翻页：只取 id 小于它的消息。
     已摘要消息（is_summary=true）仍返回——用户翻历史能看到原文；
@@ -212,12 +212,10 @@ async def load_messages(
     if before_id is not None:
         conds.append(ChatMessage.id < before_id)
 
-    rows = await db.scalars(
-        select(ChatMessage)
-        .where(*conds)
-        .order_by(ChatMessage.id.desc())
-        .limit(max(1, limit))
-    )
+    query = select(ChatMessage).where(*conds).order_by(ChatMessage.id.desc())
+    if limit is not None:
+        query = query.limit(max(1, limit))
+    rows = await db.scalars(query)
     return list(reversed(rows.all()))  # 取最新 N 条后转回时间正序
 
 
@@ -319,6 +317,26 @@ async def load_latest_usage_turn(
     )
 
 
+async def invalidate_usage_snapshots(db: AsyncSession, session_id: int) -> int:
+    """清掉该会话所有轮的 API 上下文快照，让用量回退到估算。
+
+    压缩后历史口径变了，旧 turn 的 last_* 已不代表当前上下文；
+    只清 last_*，保留 input/output/total 的计费累加值。
+    """
+    turns = (
+        await db.scalars(
+            select(ChatTurn).where(
+                ChatTurn.session_id == session_id,
+                ChatTurn.last_input_tokens > 0,
+            )
+        )
+    ).all()
+    for turn in turns:
+        turn.last_input_tokens = 0
+        turn.last_output_tokens = 0
+    return len(turns)
+
+
 async def get_summary(db: AsyncSession, session_id: int) -> ChatSummary | None:
     """取会话摘要；一个会话最多一条。"""
     return await db.scalar(
@@ -368,6 +386,9 @@ async def mark_summarized(
     else:
         existing.content = summary.strip()
         existing.model = model
+
+    # 历史口径已变：清掉旧 turn 的 API 上下文快照，下次问答写入新快照前一律估算。
+    await invalidate_usage_snapshots(db, session_id)
 
     await db.commit()
     return len(rows)

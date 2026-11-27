@@ -20,14 +20,15 @@ def test_sections_wrapped_in_xml_tags_with_blank_lines():
     )
     assert result == (
         "基础提示词\n\n"
-        "<soul>\n行为准则\n简洁回答\n</soul>\n\n"
-        "<identity>\n身份锚点\n你是助手\n</identity>\n\n"
-        "<time>今天是 2026-01-01 周四（北京时间）。</time>"
+        "<soul>\n简洁回答\n</soul>\n\n"
+        "<identity>\n你是助手\n</identity>"
     )
+    assert "行为准则" not in result
+    assert "身份锚点" not in result
 
 
 def test_section_header_uses_lowercase_tag():
-    assert section_header("soul", "policy", "行为准则") == "<soul>\n行为准则\n</soul>"
+    assert section_header("soul", "policy", "行为准则") == "<soul>\n</soul>"
 
 
 def test_rebuild_is_idempotent_and_accepts_legacy_brackets():

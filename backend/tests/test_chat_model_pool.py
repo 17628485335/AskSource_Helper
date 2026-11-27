@@ -355,6 +355,29 @@ def test_stream_drops_stored_system_messages(monkeypatch):
     assert [m.content for m in sent if not isinstance(m, SystemMessage)] == ["hi"]
 
 
+def test_stream_merges_context_summary_into_head_system(monkeypatch):
+    """摘要 SystemMessage 不能像普通历史 system 行那样被丢掉。"""
+    monkeypatch.setattr(
+        chat_manager_module, "build_model", lambda *_a, **_k: _SpyMessagesModel()
+    )
+    agent = ModelAgent("deepseek", "deepseek-chat", api_key="sk-1", tools=[])
+    graph = _StubGraph()
+    agent.agent = graph
+    summary = SystemMessage(content="<message_summary>\n用户偏好简洁\n</message_summary>")
+
+    async def ask() -> None:
+        async for _ in agent.stream([summary, HumanMessage(content="hi")]):
+            pass
+
+    asyncio.run(ask())
+    sent = graph.states[0]["messages"]
+    systems = [m for m in sent if isinstance(m, SystemMessage)]
+    assert len(systems) == 1
+    assert sent[0] is systems[0]
+    assert systems[0].content == f"{DEFAULT_SYSTEM_PROMPT}\n\n{summary.content}"
+    assert [m.content for m in sent if not isinstance(m, SystemMessage)] == ["hi"]
+
+
 # ---------------- 时效上下文与工具返回 ----------------
 
 
@@ -369,12 +392,10 @@ def test_date_line_uses_beijing_wall_clock():
     )
 
 
-def test_compose_prompt_appends_date_without_tool_hints():
-    assert compose_system_prompt("你好", now=datetime(2026, 1, 1, tzinfo=LOCAL_TZ)) == (
-        "你好\n\n<time>今天是 2026-01-01 周四（北京时间）。</time>"
-    )
+def test_compose_prompt_has_no_date_or_tool_hints():
+    assert compose_system_prompt("你好", now=datetime(2026, 1, 1, tzinfo=LOCAL_TZ)) == "你好"
     assert "[n]" not in compose_system_prompt("你好")
-    # 传空串 = 本轮不带系统消息，不能被日期行救回去
+    # 传空串 = 本轮不带系统消息
     assert compose_system_prompt("") == ""
     assert compose_system_prompt("   \n") == ""
 

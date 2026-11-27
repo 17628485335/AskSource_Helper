@@ -9,7 +9,11 @@ import { useAuth } from '../stores/auth'
 import { useModels } from '../stores/models'
 import { useAgents } from '../stores/agents'
 import type { AgentDto, ChatModelOption } from '../api/settings'
-import { getContextUsage, type ContextUsageDto } from '../api/session'
+import {
+  compactSessionHistory,
+  getContextUsage,
+  type ContextUsageDto,
+} from '../api/session'
 import { formatDateTime, formatTokenCompact } from '../utils/format'
 import { sourceHost, safeHttpUrl } from '../utils/url'
 
@@ -246,6 +250,9 @@ onMounted(() => jumpToLatest())
 const usageEntry = ref<{ session: number; data: ContextUsageDto } | null>(null)
 const contextLoading = ref(false)
 const contextError = ref('')
+const compacting = ref(false)
+const compactError = ref('')
+const compactNotice = ref('')
 let contextRequestSeq = 0
 
 const contextUsage = computed(() =>
@@ -275,10 +282,35 @@ async function refreshContextUsage() {
   }
 }
 
+/** 手动压缩更早轮次；直接用接口返回的用量替换当前显示，避免再发一次 GET */
+async function compactHistory() {
+  if (sessionId.value == null || busy.value || compacting.value) return
+  const session = sessionId.value
+  const size = pickedModel.value?.context_size || 200000
+  compacting.value = true
+  compactError.value = ''
+  compactNotice.value = ''
+  try {
+    const result = await compactSessionHistory(session, size)
+    if (sessionId.value === session) {
+      usageEntry.value = { session, data: result }
+      compactNotice.value = '已压缩'
+    }
+  } catch (e) {
+    compactError.value = e instanceof Error ? e.message : '压缩失败'
+  } finally {
+    compacting.value = false
+  }
+}
+
 /** 会话切换、模型窗口变化、流式结束时刷新（不在每个 token 到达时请求） */
 watch(
   [sessionId, pickedModel],
-  () => void refreshContextUsage(),
+  () => {
+    compactError.value = ''
+    compactNotice.value = ''
+    void refreshContextUsage()
+  },
   { immediate: true },
 )
 watch(busy, (v) => { if (!v) void refreshContextUsage() })
@@ -1378,9 +1410,20 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div>
-          <div class="flex items-baseline justify-between mb-1.5">
+          <div class="flex items-center justify-between mb-1.5">
             <p class="text-[10.5px] text-stone-400">上下文用量</p>
-            <span class="text-[10.5px] text-stone-400">{{ contextLoading ? '计算中…' : '' }}</span>
+            <div class="flex items-center gap-2">
+              <span class="text-[10.5px] text-stone-400">{{ contextLoading ? '计算中…' : '' }}</span>
+              <button
+                type="button"
+                @click="compactHistory"
+                :disabled="sessionId == null || busy || compacting"
+                title="压缩更早的对话历史"
+                class="h-6 rounded-md border border-stone-200 bg-white px-2 text-[10px] text-stone-500 transition hover:border-stone-300 hover:text-stone-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {{ compacting ? '压缩中…' : '压缩' }}
+              </button>
+            </div>
           </div>
           <template v-if="contextUsage">
             <div class="h-1.5 w-full overflow-hidden rounded-full bg-stone-200/80">
@@ -1403,6 +1446,8 @@ onBeforeUnmount(() => {
             <p v-if="contextUsage.summary_chars" class="mt-1 text-[10px] text-stone-400">
               已压缩历史 · 摘要 {{ contextUsage.summary_chars }} 字
             </p>
+            <p v-if="compactError" class="mt-1 text-[10px] text-red-500">{{ compactError }}</p>
+            <p v-else-if="compactNotice" class="mt-1 text-[10px] text-emerald-600">{{ compactNotice }}</p>
           </template>
           <p v-else class="text-[11.5px] text-stone-400">—</p>
         </div>

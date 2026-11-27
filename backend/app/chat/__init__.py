@@ -14,7 +14,7 @@ from .chat_manager import (
     load_tools,
 )
 from .schemas import ChatRequest
-from .service import stream_chat
+from .service import astream_chat
 
 __all__ = [
     "ChatRequest",
@@ -23,5 +23,5 @@ __all__ = [
     "ChatConfigError",
     "DEFAULT_SYSTEM_PROMPT",
     "load_tools",
-    "stream_chat",
+    "astream_chat",
 ]

@@ -283,7 +283,3 @@ async def astream_chat(
         if not persisted:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await asyncio.shield(persist())
-
-
-# 兼容 router / 测试里的既有导入名；函数实现以 astream_chat 为准
-stream_chat = astream_chat

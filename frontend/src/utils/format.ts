@@ -18,9 +18,9 @@ export function formatDay(iso: string): string {
   return sameYear ? md : `${d.getFullYear()}年${md}`
 }
 
-/** 上下文窗口的简短展示：200K / 1M；沿用 1024*1024 判定 M、1000 判定 K */
+/** 上下文窗口的简短展示，统一用 K：200000 → 200K，1048576(1M) → 1000K */
 export function formatTokenCompact(tokens?: number): string {
   if (!tokens || tokens <= 0) return ''
-  if (tokens >= 1024 * 1024) return `${Math.round(tokens / (1024 * 1024))}M`
+  if (tokens >= 1024 * 1024) return `${Math.round(tokens / (1024 * 1024) * 1000)}K`
   return `${Math.round(tokens / 1000)}K`
 }

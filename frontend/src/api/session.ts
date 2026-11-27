@@ -116,3 +116,14 @@ export function getContextUsage(sessionId: number, contextSize: number): Promise
     { withAuth: true },
   )
 }
+
+/** 手动压缩更早轮次；返回压缩后的上下文用量，省掉前端二次拉取 */
+export function compactSessionHistory(
+  sessionId: number,
+  contextSize: number,
+): Promise<ContextUsageDto> {
+  return request<ContextUsageDto>(
+    `/sessions/${sessionId}/compact?context_size=${contextSize}`,
+    { withAuth: true, method: 'POST' },
+  )
+}
