@@ -242,13 +242,19 @@ async def find_user_doc(
 
 # ---------------- Agent memories ----------------
 
-async def list_agent_memories(db: AsyncSession, agent_id: int) -> list[AgentMemory]:
+async def list_agent_memories(
+    db: AsyncSession, agent_id: int, user_id: int | None = None
+) -> list[AgentMemory]:
+    """按 agent 取记忆；传 user_id 时只取全局 + 该用户，不传则取全部。"""
+    query = select(AgentMemory).where(AgentMemory.agent_id == agent_id)
+    if user_id is not None:
+        query = query.where(
+            or_(AgentMemory.user_id == 0, AgentMemory.user_id == user_id)
+        )
     return list(
         (
             await db.scalars(
-                select(AgentMemory)
-                .where(AgentMemory.agent_id == agent_id)
-                .order_by(AgentMemory.id)
+                query.order_by(AgentMemory.id)
             )
         ).all()
     )
@@ -257,7 +263,11 @@ async def list_agent_memories(db: AsyncSession, agent_id: int) -> list[AgentMemo
 async def create_agent_memory(
     db: AsyncSession, agent_id: int, payload: AgentMemoryCreate
 ) -> AgentMemory:
-    row = AgentMemory(agent_id=agent_id, content=payload.content)
+    row = AgentMemory(
+        agent_id=agent_id,
+        user_id=payload.user_id,
+        content=payload.content,
+    )
     db.add(row)
     await db.commit()
     await db.refresh(row)
@@ -265,10 +275,17 @@ async def create_agent_memory(
 
 
 async def update_agent_memory(
-    db: AsyncSession, agent_id: int, memory_id: int, payload: AgentMemoryUpdate
+    db: AsyncSession,
+    agent_id: int,
+    memory_id: int,
+    payload: AgentMemoryUpdate,
+    *,
+    user_id: int | None = None,
 ) -> AgentMemory:
     row = await db.get(AgentMemory, memory_id)
     if row is None or row.agent_id != agent_id:
+        raise ContextNotFound(f"长期记忆 {memory_id} 不存在")
+    if user_id is not None and row.user_id != user_id:
         raise ContextNotFound(f"长期记忆 {memory_id} 不存在")
     for key, value in payload.model_dump(exclude_unset=True).items():
         setattr(row, key, value)
@@ -277,9 +294,17 @@ async def update_agent_memory(
     return row
 
 
-async def delete_agent_memory(db: AsyncSession, agent_id: int, memory_id: int) -> None:
+async def delete_agent_memory(
+    db: AsyncSession,
+    agent_id: int,
+    memory_id: int,
+    *,
+    user_id: int | None = None,
+) -> None:
     row = await db.get(AgentMemory, memory_id)
     if row is None or row.agent_id != agent_id:
+        raise ContextNotFound(f"长期记忆 {memory_id} 不存在")
+    if user_id is not None and row.user_id != user_id:
         raise ContextNotFound(f"长期记忆 {memory_id} 不存在")
     await db.delete(row)
     await db.commit()

@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import SystemMessage
 
 from app.context.assembler import build_skills_snapshot
-from app.context.models import AgentContextBinding, AgentContextDoc, UserContextDoc
+from app.context.models import AgentContextBinding, AgentContextDoc, AgentMemory, UserContextDoc
 from app.main import app
 
 client = TestClient(app)
@@ -95,6 +95,49 @@ def test_list_agent_docs_uses_or_for_scoped_and_global():
     assert " AND " not in sql
 
 
+def test_list_agent_memories_scopes_global_and_user():
+    from app.context.service import list_agent_memories
+
+    calls = []
+
+    class FakeScalars:
+        def all(self):
+            return []
+
+    class FakeDb:
+        async def scalars(self, stmt):
+            calls.append(str(stmt.compile(compile_kwargs={"literal_binds": True})))
+            return FakeScalars()
+
+    asyncio.run(list_agent_memories(FakeDb(), 7, user_id=3))
+    sql = calls[0]
+    assert "agent_id = 7" in sql
+    assert "user_id = 0" in sql
+    assert "user_id = 3" in sql
+    assert " OR " in sql
+
+
+def test_create_agent_memory_uses_payload_user_id():
+    from app.context.schemas import AgentMemoryCreate
+    from app.context.service import create_agent_memory
+
+    class FakeDb:
+        def add(self, _row):
+            pass
+
+        async def commit(self):
+            pass
+
+        async def refresh(self, _row):
+            pass
+
+    row = asyncio.run(
+        create_agent_memory(FakeDb(), 7, AgentMemoryCreate(user_id=3, content="x"))
+    )
+    assert row.user_id == 3
+    assert row.agent_id == 7
+
+
 def test_orm_tables_have_expected_columns():
     assert {
         "agent_id", "key", "resolver", "ref_key", "enabled", "priority",
@@ -105,6 +148,9 @@ def test_orm_tables_have_expected_columns():
     )
     assert {"user_id", "key", "content", "version_hash"} <= set(
         UserContextDoc.__table__.columns.keys()
+    )
+    assert {"agent_id", "user_id", "content", "enabled"} <= set(
+        AgentMemory.__table__.columns.keys()
     )
 
 

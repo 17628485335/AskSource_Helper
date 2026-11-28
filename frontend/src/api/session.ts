@@ -44,6 +44,8 @@ export interface TurnUsageDto {
   input_tokens: number
   output_tokens: number
   total_tokens: number
+  /** 最后一次模型调用的 input tokens；与 input_token_details 同口径，用于算缓存命中率 */
+  last_input_tokens: number
   input_token_details: Record<string, number>
   output_token_details: Record<string, number>
   model_calls: number

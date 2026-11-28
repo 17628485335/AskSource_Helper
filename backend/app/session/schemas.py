@@ -62,6 +62,8 @@ class TurnUsageOut(BaseModel):
     input_tokens: int
     output_tokens: int
     total_tokens: int
+    # 最后一次模型调用的 input tokens；input_token_details 也是最后一段的，算命中率要用它做分母
+    last_input_tokens: int = 0
     input_token_details: dict[str, Any] = Field(default_factory=dict)
     output_token_details: dict[str, Any] = Field(default_factory=dict)
     model_calls: int = 0

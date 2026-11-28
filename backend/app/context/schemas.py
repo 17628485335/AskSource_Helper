@@ -124,6 +124,8 @@ class SystemPromptComposeResponse(BaseModel):
 
 
 class AgentMemoryCreate(BaseModel):
+    # 0 = agent 全局记忆；非 0 只对该用户生效
+    user_id: int = Field(default=0, ge=0)
     content: str = Field(max_length=20000)
 
 
@@ -137,6 +139,7 @@ class AgentMemoryOut(BaseModel):
 
     id: int
     agent_id: int
+    user_id: int
     content: str
     enabled: bool
     created_at: datetime

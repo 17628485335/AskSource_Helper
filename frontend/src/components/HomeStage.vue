@@ -529,6 +529,15 @@ const lastActivity = computed(() => {
   return done.length ? new Date().toLocaleTimeString('zh-CN', { hour12: false }) : ''
 })
 
+/** 缓存命中率：cache_read / 最后一段 input；旧数据没有 last_input_tokens 时回退整轮 input。
+ *  命中率与命中 token 同口径（都是最后一次模型调用的），多段调用时不会被累加值稀释。 */
+function cacheHitRate(usage: ChatMessage['turnUsage']): number | null {
+  const hit = usage?.input_token_details?.cache_read
+  const input = usage?.last_input_tokens || usage?.input_tokens
+  if (!hit || !input) return null
+  return Math.min(100, (hit / input) * 100)
+}
+
 /** 按钮里最多展示 3 个不同站点的图标，同一域名只占一个位置 */
 function buttonSources(citations: ChatMessage['citations']) {
   const seen = new Set<string>()
@@ -919,6 +928,9 @@ onBeforeUnmount(() => {
                     <circle cx="12" cy="12" r="3" />
                   </svg>
                   {{ m.turnUsage.total_tokens.toLocaleString() }} tokens
+                  <span v-if="cacheHitRate(m.turnUsage) !== null" class="text-emerald-600">
+                    · 缓存 {{ cacheHitRate(m.turnUsage)!.toFixed(0) }}%
+                  </span>
                 </button>
                 <div
                   v-if="hoveredUsageIndex === i"
@@ -935,6 +947,8 @@ onBeforeUnmount(() => {
                   <template v-if="m.turnUsage.input_token_details?.cache_read">
                     <span class="text-stone-400">缓存命中</span>
                     <span class="text-right text-emerald-600">{{ m.turnUsage.input_token_details.cache_read.toLocaleString() }}</span>
+                    <span class="text-stone-400">缓存命中率</span>
+                    <span class="text-right text-emerald-600">{{ cacheHitRate(m.turnUsage)?.toFixed(1) }}%</span>
                   </template>
                   <template v-if="m.turnUsage.output_token_details?.reasoning">
                     <span class="text-stone-400">推理</span>

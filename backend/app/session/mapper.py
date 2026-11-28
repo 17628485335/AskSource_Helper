@@ -28,6 +28,7 @@ def to_message_outs(
                 input_tokens=turn.input_tokens,
                 output_tokens=turn.output_tokens,
                 total_tokens=turn.total_tokens,
+                last_input_tokens=turn.last_input_tokens or 0,
                 input_token_details=turn.input_token_details or {},
                 output_token_details=turn.output_token_details or {},
                 model_calls=turn.model_calls,

@@ -673,6 +673,7 @@ function addMemoryDraft() {
   memoryDrafts.value.push({
     id: --memoryDraftSeq,
     agent_id: agentId,
+    user_id: 0,
     content: '',
     enabled: true,
     created_at: '',

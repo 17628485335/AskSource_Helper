@@ -385,6 +385,8 @@ export function composeSystemPrompt(payload: {
 export interface AgentMemoryDto {
   id: number
   agent_id: number
+  /** 0 = agent 全局记忆；非 0 = 该用户专属 */
+  user_id: number
   content: string
   enabled: boolean
   created_at: string

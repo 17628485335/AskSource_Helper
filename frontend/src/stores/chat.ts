@@ -46,6 +46,8 @@ export interface TurnUsage {
   input_tokens: number
   output_tokens: number
   total_tokens: number
+  /** 最后一次模型调用的 input tokens；与 input_token_details 同口径，用于算缓存命中率 */
+  last_input_tokens: number
   input_token_details: Record<string, number>
   output_token_details: Record<string, number>
   model_calls: number
@@ -125,6 +127,8 @@ function applyEvent(event: ChatEvent, bubble: ChatMessage) {
           input_tokens: (prev?.input_tokens ?? 0) + event.input_tokens,
           output_tokens: (prev?.output_tokens ?? 0) + event.output_tokens,
           total_tokens: (prev?.total_tokens ?? 0) + event.total_tokens,
+          // details 只保留最后一段，分母也用它，命中率口径才一致
+          last_input_tokens: event.input_tokens,
           input_token_details: event.input_token_details,
           output_token_details: event.output_token_details,
           model_calls: (prev?.model_calls ?? 0) + 1,
@@ -264,6 +268,7 @@ async function loadSession(
             input_tokens: r.turn_usage.input_tokens,
             output_tokens: r.turn_usage.output_tokens,
             total_tokens: r.turn_usage.total_tokens,
+            last_input_tokens: r.turn_usage.last_input_tokens ?? 0,
             input_token_details: r.turn_usage.input_token_details ?? {},
             output_token_details: r.turn_usage.output_token_details ?? {},
             model_calls: r.turn_usage.model_calls,

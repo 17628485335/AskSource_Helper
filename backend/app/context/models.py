@@ -100,7 +100,10 @@ class UserContextDoc(Base):
 
 
 class AgentMemory(Base):
-    """agent 的长期记忆；按条管理，每条是一段可独立启用/停用事实"""
+    """agent 的长期记忆；按条管理，每条是一段可独立启用/停用事实。
+
+    user_id=0 表示 agent 全局记忆；非 0 时只属于该用户。
+    """
 
     __tablename__ = "agent_memories"
 
@@ -108,6 +111,8 @@ class AgentMemory(Base):
     agent_id: Mapped[int] = mapped_column(
         ForeignKey("agents.id", ondelete="CASCADE"), index=True
     )
+    # 不建 FK：0 是全局哨兵值，不是真实用户
+    user_id: Mapped[int] = mapped_column(Integer, default=0, index=True)
     content: Mapped[str] = mapped_column(Text)
     enabled: Mapped[bool] = mapped_column(default=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

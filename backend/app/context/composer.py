@@ -57,7 +57,7 @@ async def compose_system_prompt(
         agent = await agent_service.get_agent(db, agent_id)
         all_tools = [spec.name for spec in list_tool_specs()]
         effective_tools = agent.tool_names if agent.tool_names is not None else all_tools
-        memories = await context_service.list_agent_memories(db, agent.id)
+        memories = await context_service.list_agent_memories(db, agent.id, user_id=user_id)
         for binding in await context_service.list_bindings(db, agent.id):
             if not binding.enabled:
                 continue

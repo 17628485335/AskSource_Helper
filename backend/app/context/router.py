@@ -4,7 +4,7 @@ agent 绑定 / agent 文档：管理员维护。
 user 文档：当前用户只能管理自己的资料。
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents import service as agent_service
@@ -335,12 +335,13 @@ async def compose_system_prompt(
 )
 async def list_memories(
     agent_id: int,
+    user_id: int | None = Query(default=None, ge=0, description="不传=全部；0=agent 全局"),
     current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ) -> list[AgentMemoryOut]:
     try:
         await _ensure_agent(db, agent_id)
-        return await context_service.list_agent_memories(db, agent_id)
+        return await context_service.list_agent_memories(db, agent_id, user_id=user_id)
     except (context_service.ContextNotFound, agent_service.AgentNotFound) as exc:
         raise _http_error(exc) from exc
 
@@ -373,12 +374,15 @@ async def update_memory(
     memory_id: int,
     agent_id: int,
     payload: AgentMemoryUpdate,
+    user_id: int | None = Query(default=None, ge=0, description="不传=不限制用户范围"),
     current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ) -> AgentMemoryOut:
     try:
         await _ensure_agent(db, agent_id)
-        return await context_service.update_agent_memory(db, agent_id, memory_id, payload)
+        return await context_service.update_agent_memory(
+            db, agent_id, memory_id, payload, user_id=user_id
+        )
     except (context_service.ContextConflict, context_service.ContextNotFound, agent_service.AgentNotFound) as exc:
         raise _http_error(exc) from exc
 
@@ -391,12 +395,13 @@ async def update_memory(
 async def delete_memory(
     memory_id: int,
     agent_id: int,
+    user_id: int | None = Query(default=None, ge=0, description="不传=不限制用户范围"),
     current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     try:
         await _ensure_agent(db, agent_id)
-        await context_service.delete_agent_memory(db, agent_id, memory_id)
+        await context_service.delete_agent_memory(db, agent_id, memory_id, user_id=user_id)
     except (context_service.ContextNotFound, agent_service.AgentNotFound) as exc:
         raise _http_error(exc) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
